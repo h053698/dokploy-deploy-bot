@@ -16,8 +16,8 @@ const reader = (files: Record<string, string>) => async (path: string) => files[
 
 describe("parseRepoUrl", () => {
   test.each([
-    ["https://github.com/h053698/dokploy-deploy-bot", "h053698", "dokploy-deploy-bot"],
-    ["https://github.com/h053698/dokploy-deploy-bot.git", "h053698", "dokploy-deploy-bot"],
+    ["https://github.com/acme/dokploy-deploy-bot", "acme", "dokploy-deploy-bot"],
+    ["https://github.com/acme/dokploy-deploy-bot.git", "acme", "dokploy-deploy-bot"],
     ["github.com/o/r/tree/main/src", "o", "r"],
     ["git@github.com:o/my.repo.git", "o", "my.repo"],
     ["o/r", "o", "r"],
@@ -107,10 +107,10 @@ describe("domains", () => {
   });
 
   test("normalizeDomain", () => {
-    expect(normalizeDomain("myapp", "arpa.page")).toBe("myapp.arpa.page");
-    expect(normalizeDomain("https://App.Example.com/path", "arpa.page")).toBe("app.example.com");
-    expect(normalizeDomain("bad domain", "arpa.page")).toBeNull();
-    expect(normalizeDomain("-x.arpa.page", "arpa.page")).toBeNull();
+    expect(normalizeDomain("myapp", "example.test")).toBe("myapp.example.test");
+    expect(normalizeDomain("https://App.Example.com/path", "example.test")).toBe("app.example.com");
+    expect(normalizeDomain("bad domain", "example.test")).toBeNull();
+    expect(normalizeDomain("-x.example.test", "example.test")).toBeNull();
   });
 });
 

@@ -1,6 +1,6 @@
-import { lookup } from "node:dns/promises";
 import { generateDockerfile } from "./ai.ts";
 import type { AppBuildType, BuildPlan } from "./analyze.ts";
+import { checkDomain, type DnsReport, type DnsState, type Resolver, serverAddresses, systemResolver } from "./dns.ts";
 import { type Config, dokployDomainTls, publicUrl } from "./config.ts";
 import type { DkDeployment, DkDomain, DkGithubProvider, DkGithubRepo, DkPatch, Dokploy, FetchLike } from "./dokploy.ts";
 import { type GitHub, type RepoInfo, type RepoRef, repoKey } from "./github.ts";
@@ -34,6 +34,7 @@ export interface Target {
 }
 
 export interface DeployRequest {
+  dns?: DnsState | null;
   repo: RepoInfo;
   files: string[];
   plan: BuildPlan;
@@ -78,18 +79,9 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 export interface DeployerHooks {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
-  resolveHost?: (host: string) => Promise<boolean>;
+  resolver?: Resolver;
   aiFetch?: FetchLike;
 }
-
-const resolvesViaDns = async (host: string) => {
-  try {
-    await lookup(host);
-    return true;
-  } catch {
-    return false;
-  }
-};
 
 interface SearchPage<T> {
   items: T[];
@@ -115,7 +107,7 @@ interface SearchCompose {
 export class Deployer {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
-  private readonly resolveHost: (host: string) => Promise<boolean>;
+  private readonly resolver: Resolver;
   private readonly aiFetch: FetchLike;
 
   constructor(
@@ -126,7 +118,7 @@ export class Deployer {
   ) {
     this.sleep = hooks.sleep ?? delay;
     this.now = hooks.now ?? Date.now;
-    this.resolveHost = hooks.resolveHost ?? resolvesViaDns;
+    this.resolver = hooks.resolver ?? systemResolver;
     this.aiFetch = hooks.aiFetch ?? fetch;
   }
 
@@ -172,8 +164,15 @@ export class Deployer {
     return (await this.listManaged()).filter((s) => s.repo === key);
   }
 
-  domainResolves(host: string): Promise<boolean> {
-    return this.resolveHost(host);
+  async dnsReport(host: string): Promise<DnsReport & { serverIps: string[] }> {
+    const serverIps = await serverAddresses(this.cfg.dokployUrl, this.resolver);
+    const report = await checkDomain(host, serverIps, this.resolver);
+    return { ...report, serverIps: [...serverIps] };
+  }
+
+  async usedHosts(): Promise<Set<string>> {
+    const rows = await this.dk.get<{ host: string }[]>("overview.domains");
+    return new Set(rows.map((row) => row.host.toLowerCase()));
   }
 
   async domainsOf(service: ManagedService): Promise<DkDomain[]> {
@@ -259,8 +258,8 @@ export class Deployer {
     return publicUrl(this.cfg, host);
   }
 
-  private domainBody(host: string, port: number) {
-    return { host, path: "/", port, ...dokployDomainTls(this.cfg) };
+  private domainBody(host: string, port: number, dns: DnsState | null | undefined) {
+    return { host, path: "/", port, ...dokployDomainTls(this.cfg, dns) };
   }
 
   async deploy(req: DeployRequest, reporter: Reporter): Promise<DeployResult> {
@@ -294,7 +293,7 @@ export class Deployer {
       await reporter.step(`Compose 서비스 만들고 소스 연결 (${sourceLabel})`);
       if (req.domain) {
         await this.dk.post("domain.create", {
-          ...this.domainBody(req.domain, plan.port),
+          ...this.domainBody(req.domain, plan.port, req.dns),
           composeId: compose.composeId,
           serviceName: plan.serviceName,
           domainType: "compose",
@@ -344,7 +343,7 @@ export class Deployer {
       await reporter.step(`앱 만들고 소스 연결 (${sourceLabel}) · ${this.buildLabel(plan)}`);
       if (req.domain) {
         await this.dk.post("domain.create", {
-          ...this.domainBody(req.domain, plan.port),
+          ...this.domainBody(req.domain, plan.port, req.dns),
           applicationId: app.applicationId,
           domainType: "application",
         });

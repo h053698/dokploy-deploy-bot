@@ -23,7 +23,7 @@ describe("GitHub App fallback for private repos", () => {
       const path = new URL(String(input)).pathname.replace("/api/", "");
       dkCalls.push(path);
       if (path === "github.githubProviders") return Response.json([{ githubId: "gh1" }]);
-      if (path === "github.getGithubRepositories") return Response.json([{ name: "website", owner: { login: "solixcorp" } }]);
+      if (path === "github.getGithubRepositories") return Response.json([{ name: "website", owner: { login: "acme-org" } }]);
       if (path === "github.one") return Response.json({ githubAppId: 4406416, githubInstallationId: "149364421", githubPrivateKey: PEM });
       return new Response("nope", { status: 500 });
     };
@@ -41,10 +41,10 @@ describe("GitHub App fallback for private repos", () => {
         return Response.json({ name: "express-hello-world", owner: { login: "render-examples" }, default_branch: "main", private: false, clone_url: "c", html_url: "h" });
       }
       if (auth !== "Bearer ghs_install") return new Response("Not Found", { status: 404 });
-      if (url.pathname === "/repos/solixcorp/website") {
-        return Response.json({ name: "website", owner: { login: "solixcorp" }, default_branch: "main", private: true, clone_url: "c", html_url: "h" });
+      if (url.pathname === "/repos/acme-org/website") {
+        return Response.json({ name: "website", owner: { login: "acme-org" }, default_branch: "main", private: true, clone_url: "c", html_url: "h" });
       }
-      if (url.pathname === "/repos/solixcorp/website/git/trees/main") return Response.json({ tree: [{ path: "package.json", type: "blob" }] });
+      if (url.pathname === "/repos/acme-org/website/git/trees/main") return Response.json({ tree: [{ path: "package.json", type: "blob" }] });
       return new Response("Not Found", { status: 404 });
     };
 
@@ -55,19 +55,19 @@ describe("GitHub App fallback for private repos", () => {
     expect(pub.private).toBe(false);
     expect(minted).toBe(0);
 
-    const info = await gh.repo({ owner: "solixcorp", repo: "website" });
+    const info = await gh.repo({ owner: "acme-org", repo: "website" });
     expect(info.private).toBe(true);
     expect(await gh.treeBlobs(info, "main")).toEqual(["package.json"]);
     expect(minted).toBe(1);
-    expect(ghCalls.filter((c) => c.includes("solixcorp"))).toEqual([
-      "GET /repos/solixcorp/website anon",
-      "GET /repos/solixcorp/website Bearer ghs_install",
-      "GET /repos/solixcorp/website/git/trees/main Bearer ghs_install",
+    expect(ghCalls.filter((c) => c.includes("acme-org"))).toEqual([
+      "GET /repos/acme-org/website anon",
+      "GET /repos/acme-org/website Bearer ghs_install",
+      "GET /repos/acme-org/website/git/trees/main Bearer ghs_install",
     ]);
     expect(ghCalls).toContain("POST /app/installations/149364421/access_tokens jwt");
 
     const gh2 = new GitHub("https://api.github.test", null, ghFetch, (ref) => apps.tokenFor(ref));
-    await gh2.repo({ owner: "solixcorp", repo: "website" });
+    await gh2.repo({ owner: "acme-org", repo: "website" });
     expect(minted).toBe(1);
   });
 
@@ -75,7 +75,7 @@ describe("GitHub App fallback for private repos", () => {
     const dkFetch = async (input: string | URL | Request) => {
       const path = new URL(String(input)).pathname.replace("/api/", "");
       if (path === "github.githubProviders") return Response.json([{ githubId: "gh1" }]);
-      if (path === "github.getGithubRepositories") return Response.json([{ name: "website", owner: { login: "solixcorp" } }]);
+      if (path === "github.getGithubRepositories") return Response.json([{ name: "website", owner: { login: "acme-org" } }]);
       return new Response("nope", { status: 500 });
     };
     const ghFetch = async () => new Response("Not Found", { status: 404 });

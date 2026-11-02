@@ -1,3 +1,4 @@
+import type { DnsState } from "./dns.ts";
 export interface AiProvider {
   name: string;
   baseUrl: string;
@@ -110,10 +111,15 @@ function domainTls(env: Env): DomainTls {
 
 export const publicUrl = (cfg: Pick<Config, "domainTls">, host: string) => `${cfg.domainTls === "none" ? "http" : "https"}://${host}`;
 
-export function dokployDomainTls(cfg: Pick<Config, "domainTls">) {
-  return cfg.domainTls === "letsencrypt"
-    ? { https: true, certificateType: "letsencrypt" as const }
-    : { https: false, certificateType: "none" as const };
+export interface HostTls {
+  https: boolean;
+  certificateType: "letsencrypt" | "none";
+}
+
+export function dokployDomainTls(cfg: Pick<Config, "domainTls">, dns?: DnsState | null): HostTls {
+  if (cfg.domainTls === "none") return { https: false, certificateType: "none" };
+  const direct = dns === undefined || dns === null ? cfg.domainTls === "letsencrypt" : dns === "direct";
+  return direct ? { https: true, certificateType: "letsencrypt" } : { https: false, certificateType: "none" };
 }
 
 function idSet(env: Env, key: string): Set<number> {
@@ -146,7 +152,7 @@ export function loadConfig(env: Env = process.env): Config {
     dokployUrl: required(env, "DOKPLOY_URL").replace(/\/+$/, ""),
     dokployApiKey: required(env, "DOKPLOY_API_KEY"),
     dokployServerId: optional(env, "DOKPLOY_SERVER_ID"),
-    baseDomain: (optional(env, "BASE_DOMAIN") ?? "arpa.page").replace(/^\.+/, ""),
+    baseDomain: required(env, "BASE_DOMAIN").replace(/^\.+/, ""),
     domainTls: domainTls(env),
     railpackVersion: optional(env, "RAILPACK_VERSION") ?? "0.15.4",
     githubApiUrl: (optional(env, "GITHUB_API_URL") ?? "https://api.github.com").replace(/\/+$/, ""),

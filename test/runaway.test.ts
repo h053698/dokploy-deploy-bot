@@ -5,7 +5,7 @@ import { Dokploy } from "../src/dokploy.ts";
 import { GitHub } from "../src/github.ts";
 
 test("a deployment that never shows up times out after a bounded number of polls", async () => {
-  const cfg = loadConfig({ TELEGRAM_BOT_TOKEN: "1:x", DOKPLOY_URL: "http://dk.test", DOKPLOY_API_KEY: "k", DEPLOY_TIMEOUT_MIN: "30", POLL_INTERVAL_MS: "5000" });
+  const cfg = loadConfig({ TELEGRAM_BOT_TOKEN: "1:x", DOKPLOY_URL: "http://dk.test", DOKPLOY_API_KEY: "k", BASE_DOMAIN: "example.test", DEPLOY_TIMEOUT_MIN: "30", POLL_INTERVAL_MS: "5000" });
   let calls = 0;
   const dkFetch = async (input: string | URL | Request) => {
     calls++;

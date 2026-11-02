@@ -18,10 +18,10 @@ const telegram = new Bot(
     ? { client: { baseFetchConfig: {}, fetch: ((input, init) => fetch(input, { ...init, proxy })) as typeof fetch } }
     : {},
 );
-const access = await Access.load(cfg.accessFile, cfg.allowedUserIds, cfg.adminUserIds);
+const access = await Access.load(cfg.accessFile, cfg.allowedUserIds, cfg.adminUserIds, cfg.allowedChatIds);
 const { bot } = createBot({ cfg, access, deployer: new Deployer(cfg, dk, gh), gh }, telegram);
 const acl = access.list();
-console.log(`[deploy-bot] admins=${acl.admins.length} users=${acl.env.length}+${acl.added.length} groups=${cfg.allowedChatIds.size} (${cfg.accessFile})`);
+console.log(`[deploy-bot] admins=${acl.admins.length} users=${acl.env.length}+${acl.added.length} groups=${acl.envChats.length}+${acl.addedChats.length} (${cfg.accessFile})`);
 if (acl.admins.length === 0) console.warn("[deploy-bot] ADMIN_USER_IDS is empty: nobody can use /allow.");
 console.log(`[deploy-bot] ai=${cfg.ai ? cfg.ai.providers.map((p) => `${p.name}:${p.model}`).join(" > ") : "off"}`);
 

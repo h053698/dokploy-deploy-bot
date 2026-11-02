@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { generateDockerfile } from "../src/ai.ts";
 import { loadConfig } from "../src/config.ts";
 
-const BASE = { TELEGRAM_BOT_TOKEN: "1:x", DOKPLOY_URL: "http://d", DOKPLOY_API_KEY: "k" };
+const BASE = {
+  BASE_DOMAIN: "example.test", TELEGRAM_BOT_TOKEN: "1:x", DOKPLOY_URL: "http://d", DOKPLOY_API_KEY: "k" };
 
 describe("AI provider chain config", () => {
   test("keys define the chain in ollama > mistral > openrouter order", () => {

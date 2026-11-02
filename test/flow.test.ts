@@ -60,6 +60,12 @@ class FakeDokploy {
     return Response.json(this.handle(path, body));
   };
 
+  domainHosts: string[] = [];
+
+  addDomain(host: string) {
+    this.domainHosts.push(host);
+  }
+
   addProject(name: string, envNames: string[] = ["production"]) {
     const project = {
       projectId: `p${++this.id}`,
@@ -70,7 +76,7 @@ class FakeDokploy {
     return project;
   }
 
-  addApp(name: string, environmentId: string, repo = `h053698/${name}`) {
+  addApp(name: string, environmentId: string, repo = `acme/${name}`) {
     const app = { applicationId: `id-${name}-${environmentId}`, name, appName: name, description: `deploy-bot repo:${repo}`, buildType: "dockerfile", dockerfile: "Dockerfile", patches: [], environmentId };
     this.apps.push(app);
     return app;
@@ -148,8 +154,10 @@ class FakeDokploy {
         return "#7 RUN npm ci\nrailpack: could not determine how to build the app <script>";
       case "application.readLogs":
         return "2026-11-02T00:00:00Z listening on :3000\n2026-11-02T00:00:01Z GET / 200";
+      case "overview.domains":
+        return this.domainHosts.map((host) => ({ host }));
       case "domain.byApplicationId":
-        return [{ domainId: "dom1", host: "hello.arpa.page", https: true, port: 3000 }];
+        return [{ domainId: "dom1", host: "hello.example.test", https: true, port: 3000 }];
       default:
         return true;
     }
@@ -162,20 +170,20 @@ class FakeDokploy {
 
 const REPO = {
   name: "hello",
-  owner: { login: "h053698" },
+  owner: { login: "acme" },
   default_branch: "main",
   private: false,
-  clone_url: "https://github.com/h053698/hello.git",
-  html_url: "https://github.com/h053698/hello",
+  clone_url: "https://github.com/acme/hello.git",
+  html_url: "https://github.com/acme/hello",
 };
 
 const fakeGithub = async (input: string | URL | Request): Promise<Response> => {
   const url = new URL(String(input));
-  if (url.pathname === "/repos/h053698/hello") return Response.json(REPO);
-  if (url.pathname === "/repos/h053698/hello/git/trees/main") {
+  if (url.pathname === "/repos/acme/hello") return Response.json(REPO);
+  if (url.pathname === "/repos/acme/hello/git/trees/main") {
     return Response.json({ tree: [{ path: "package.json", type: "blob" }, { path: "index.js", type: "blob" }] });
   }
-  if (url.pathname === "/repos/h053698/hello/contents/package.json") return new Response('{"name":"hello"}');
+  if (url.pathname === "/repos/acme/hello/contents/package.json") return new Response('{"name":"hello"}');
   return new Response("not found", { status: 404 });
 };
 
@@ -190,13 +198,18 @@ interface Sent {
   payload: Record<string, unknown>;
 }
 
+const dnsTable: Record<string, string[]> = {};
+
 async function setup() {
+  for (const key of Object.keys(dnsTable)) delete dnsTable[key];
+  dnsTable["dokploy.test"] = ["203.0.113.10"];
   const cfg = loadConfig({
     TELEGRAM_BOT_TOKEN: "123:abc",
     ALLOWED_USER_IDS: String(OWNER_ID),
     ALLOWED_CHAT_IDS: String(GROUP_ID),
     ADMIN_USER_IDS: String(ADMIN_ID),
     DOMAIN_TLS: "cloudflare",
+    BASE_DOMAIN: "example.test",
     DOKPLOY_URL: "http://dokploy.test",
     DOKPLOY_API_KEY: "dk-key",
     AI_API_KEY: "ai-key",
@@ -211,7 +224,7 @@ async function setup() {
       clock += ms;
     },
     now: () => clock,
-    resolveHost: async () => false,
+    resolver: async (host) => dnsTable[host] ?? [],
     aiFetch: fakeAi,
   });
   const botInfo = { id: 1, is_bot: true, first_name: "deploy", username: "deploy_bot" } as UserFromGetMe;
@@ -229,7 +242,7 @@ async function setup() {
   const dir = await mkdtemp(join(tmpdir(), "deploy-bot-acl-"));
   tempDirs.push(dir);
   const accessFile = join(dir, "access.json");
-  const access = await Access.load(accessFile, cfg.allowedUserIds, cfg.adminUserIds);
+  const access = await Access.load(accessFile, cfg.allowedUserIds, cfg.adminUserIds, cfg.allowedChatIds);
   const { idle } = createBot({ cfg, access, deployer, gh: new GitHub(cfg.githubApiUrl, null, fakeGithub) }, bot);
   return { bot, dk, sent, idle, accessFile, cfg };
 }
@@ -312,7 +325,7 @@ describe("telegram flow", () => {
   test("/deploy wizard: build, project, env, domain, confirm, railpack then AI fallback (Cloudflare mode)", async () => {
     const { bot, dk, sent, idle } = await setup();
     dk.addProject("solix-web", ["production", "dev"]);
-    await bot.handleUpdate(command("/deploy https://github.com/h053698/hello"));
+    await bot.handleUpdate(command("/deploy https://github.com/acme/hello"));
 
     let w = wizard(sent);
     expect(bodyOf(w)).toContain("어떻게 빌드할까?");
@@ -332,18 +345,18 @@ describe("telegram flow", () => {
     await bot.handleUpdate(press(w, "새 프로젝트: hello (추천)"));
     w = wizard(sent);
     expect(bodyOf(w)).toContain("도메인은 어떻게 할까?");
-    await bot.handleUpdate(press(w, "hello.arpa.page (추천)"));
+    await bot.handleUpdate(press(w, "hello.example.test (추천)"));
     w = wizard(sent);
     expect(bodyOf(w)).toContain("이대로 올릴까?");
     expect(bodyOf(w)).toContain("프로젝트 <b>hello</b> <i>(새로 만듦)</i>");
     expect(bodyOf(w)).toContain("환경 <b>production</b>");
-    expect(bodyOf(w)).toContain("<code>https://hello.arpa.page</code>");
+    expect(bodyOf(w)).toContain("<code>https://hello.example.test</code>");
     expect(buttons(w)[0]).toMatchObject({ text: "배포하기", style: "success" });
 
     await bot.handleUpdate(press(w, "배포하기"));
     await idle();
 
-    const mutations = dk.paths().filter((p) => !["project.all", "deployment.all", "github.githubProviders", "deployment.readLogs", "application.search", "compose.search"].includes(p));
+    const mutations = dk.paths().filter((p) => !["project.all", "deployment.all", "github.githubProviders", "deployment.readLogs", "application.search", "compose.search", "overview.domains"].includes(p));
     expect(mutations).toEqual([
       "project.create",
       "application.create",
@@ -358,19 +371,19 @@ describe("telegram flow", () => {
     ]);
     const created = dk.projects.find((p) => p.name === "hello");
     expect(dk.calls.find((c) => c.path === "application.create")?.body.environmentId).toBe(created?.envs[0]?.environmentId);
-    expect(dk.calls.find((c) => c.path === "domain.create")?.body).toMatchObject({ host: "hello.arpa.page", port: 3000, https: false, certificateType: "none" });
+    expect(dk.calls.find((c) => c.path === "domain.create")?.body).toMatchObject({ host: "hello.example.test", port: 3000, https: false, certificateType: "none" });
     expect(String(dk.calls.find((c) => c.path === "patch.create")?.body.content)).toContain("FROM node:22-alpine");
     expect(aiPrompts[0]).toContain("could not determine how to build");
 
     const card = resultCard(sent, "배포 완료");
     expect(bodyOf(card)).toContain("hello / production");
-    expect(bodyOf(card)).toContain("https://hello.arpa.page");
+    expect(bodyOf(card)).toContain("https://hello.example.test");
     expect(bodyOf(card)).toContain("AI가 만든");
     expect(bodyOf(card)).toContain("<table");
     expect(card?.payload.message_effect_id).toBeDefined();
     const kb = buttons(card);
-    expect(kb.find((b) => b.text === "사이트 열기")).toMatchObject({ url: "https://hello.arpa.page", style: "success" });
-    expect(kb.find((b) => b.text === "URL 복사")?.copy_text).toEqual({ text: "https://hello.arpa.page" });
+    expect(kb.find((b) => b.text === "사이트 열기")).toMatchObject({ url: "https://hello.example.test", style: "success" });
+    expect(kb.find((b) => b.text === "URL 복사")?.copy_text).toEqual({ text: "https://hello.example.test" });
     expect(kb.find((b) => b.text === "Dokploy")?.url).toContain(`/dashboard/project/${created?.projectId}/environment/`);
     expect(kb.some((b) => b.callback_data?.startsWith("log:b:a:"))).toBe(true);
     expect(sent.some((s) => s.method === "deleteMessage")).toBe(true);
@@ -380,14 +393,14 @@ describe("telegram flow", () => {
 
   test("choosing AI Dockerfile generates it before the first build and skips the failing railpack run", async () => {
     const { bot, dk, sent, idle } = await setup();
-    await bot.handleUpdate(command("/deploy h053698/hello"));
+    await bot.handleUpdate(command("/deploy acme/hello"));
     await bot.handleUpdate(press(wizard(sent), "AI가 Dockerfile 생성"));
     await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)"));
     await bot.handleUpdate(press(wizard(sent), "도메인 없이"));
     expect(bodyOf(wizard(sent))).toContain("AI가 Dockerfile을 만들어서 빌드");
     await bot.handleUpdate(press(wizard(sent), "배포하기"));
     await idle();
-    const mutations = dk.paths().filter((p) => !["project.all", "deployment.all", "github.githubProviders", "application.search", "compose.search"].includes(p));
+    const mutations = dk.paths().filter((p) => !["project.all", "deployment.all", "github.githubProviders", "application.search", "compose.search", "overview.domains"].includes(p));
     expect(mutations).toEqual(["project.create", "application.create", "application.saveGitProvider", "patch.create", "application.saveBuildType", "application.saveEnvironment", "application.deploy"]);
     expect(dk.paths().filter((p) => p === "application.deploy")).toHaveLength(1);
     expect(aiPrompts).toHaveLength(1);
@@ -397,24 +410,102 @@ describe("telegram flow", () => {
 
   test("letsencrypt mode keeps https + certificate on the Dokploy domain", async () => {
     const dk = new FakeDokploy();
-    const cfg = loadConfig({ TELEGRAM_BOT_TOKEN: "1:x", DOKPLOY_URL: "http://dokploy.test", DOKPLOY_API_KEY: "dk-key", DOMAIN_TLS: "letsencrypt" });
-    const deployer = new Deployer(cfg, new Dokploy(cfg.dokployUrl, cfg.dokployApiKey, dk.fetch), new GitHub(cfg.githubApiUrl, null, fakeGithub), { sleep: async () => {}, now: () => 0, resolveHost: async () => true });
+    const cfg = loadConfig({ TELEGRAM_BOT_TOKEN: "1:x", DOKPLOY_URL: "http://dokploy.test", DOKPLOY_API_KEY: "dk-key", DOMAIN_TLS: "letsencrypt", BASE_DOMAIN: "example.test" });
+    const deployer = new Deployer(cfg, new Dokploy(cfg.dokployUrl, cfg.dokployApiKey, dk.fetch), new GitHub(cfg.githubApiUrl, null, fakeGithub), { sleep: async () => {}, now: () => 0, resolver: async () => ["203.0.113.10"] });
     const project = dk.addProject("p");
     const noop = { step: () => {} };
-    const repo = { owner: "h053698", repo: "hello", defaultBranch: "main", private: false, cloneUrl: "https://github.com/h053698/hello.git", htmlUrl: "h" };
+    const repo = { owner: "acme", repo: "hello", defaultBranch: "main", private: false, cloneUrl: "https://github.com/acme/hello.git", htmlUrl: "h" };
     const plan: BuildPlan = { kind: "application", buildType: "dockerfile", dockerfile: "Dockerfile", port: 3000, setPortEnv: false, warnings: [] };
     const target = { projectId: project.projectId, projectName: "p", environmentId: project.envs[0]?.environmentId ?? "", environmentName: "production" };
-    const result = await deployer.deploy({ repo, files: [], plan, domain: "hello.arpa.page", target }, noop);
+    const result = await deployer.deploy({ repo, files: [], plan, domain: "hello.example.test", target }, noop);
     expect(dk.calls.find((c) => c.path === "domain.create")?.body).toMatchObject({ https: true, certificateType: "letsencrypt" });
-    expect(result.url).toBe("https://hello.arpa.page");
+    expect(result.url).toBe("https://hello.example.test");
+  });
+
+  test("a taken default domain gets a 4-digit suffix and the plain name is not offered", async () => {
+    const { bot, dk, sent, idle } = await setup();
+    dk.addDomain("hello.example.test");
+    await bot.handleUpdate(command("/deploy acme/hello"));
+    await bot.handleUpdate(railpack(sent));
+    await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)"));
+    const w = wizard(sent);
+    expect(bodyOf(w)).toContain("hello.example.test</code>는 이미 쓰는 중이라");
+    const labels = buttons(w).map((b) => b.text);
+    expect(labels.some((l) => /^hello-\d{4}\.example\.test \(추천\)$/.test(l))).toBe(true);
+    expect(labels).not.toContain("hello.example.test (추천)");
+    await bot.handleUpdate(press(w, /^hello-\d{4}\.example\.test/));
+    await bot.handleUpdate(press(wizard(sent), "배포하기"));
+    await idle();
+    expect(String(dk.calls.find((c) => c.path === "domain.create")?.body.host)).toMatch(/^hello-\d{4}\.example\.test$/);
+  });
+
+  test("a typed domain that is already in use is rejected with a free alternative", async () => {
+    const { bot, dk, sent } = await setup();
+    dk.addDomain("my-api.example.test");
+    await bot.handleUpdate(command("/deploy acme/hello"));
+    await bot.handleUpdate(railpack(sent));
+    await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)"));
+    await bot.handleUpdate(press(wizard(sent), "직접 입력"));
+    await bot.handleUpdate(reply("my-api"));
+    const refusal = bodyOf(outbound(sent));
+    expect(refusal).toContain("my-api.example.test</code>는 이미 쓰는 도메인이야");
+    expect(refusal).toMatch(/my-api-\d{4}\.example\.test/);
+    await bot.handleUpdate(reply("my-api-2"));
+    expect(bodyOf(wizard(sent))).toContain("my-api-2.example.test");
+  });
+
+  test("a domain taken between choosing and confirming sends the wizard back to the domain step", async () => {
+    const { bot, dk, sent } = await setup();
+    await bot.handleUpdate(command("/deploy acme/hello"));
+    await bot.handleUpdate(railpack(sent));
+    await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)"));
+    await bot.handleUpdate(press(wizard(sent), "hello.example.test (추천)"));
+    dk.addDomain("hello.example.test");
+    await bot.handleUpdate(press(wizard(sent), "배포하기"));
+    expect(dk.paths()).not.toContain("application.create");
+    expect(bodyOf(wizard(sent))).toContain("도메인은 어떻게 할까?");
+    expect(bodyOf(outbound(sent))).toContain("방금 다른 서비스가 쓰기 시작했어");
+    expect(buttons(wizard(sent)).some((b) => /^hello-\d{4}\.example\.test \(추천\)$/.test(b.text))).toBe(true);
+  });
+
+  test("default-base domains skip the DNS panel, custom domains show state-specific guidance and a recheck button", async () => {
+    const { bot, sent } = await setup();
+    await bot.handleUpdate(command("/deploy acme/hello"));
+    await bot.handleUpdate(railpack(sent));
+    await bot.handleUpdate(press(wizard(sent), /^새 프로젝트/));
+    await bot.handleUpdate(press(wizard(sent), /\(추천\)$/));
+    expect(bodyOf(wizard(sent))).not.toContain("DNS 확인");
+    expect(buttons(wizard(sent)).map((b) => b.text)).not.toContain("DNS 다시 확인");
+
+    await bot.handleUpdate(press(wizard(sent), "뒤로"));
+    await bot.handleUpdate(press(wizard(sent), "직접 입력"));
+    await bot.handleUpdate(reply("shop.example.com"));
+    let w = wizard(sent);
+    expect(bodyOf(w)).toContain("shop.example.com</code>가 아직 설정되지 않았어");
+    expect(bodyOf(w)).toContain("203.0.113.10");
+    expect(bodyOf(w)).toContain("Flexible");
+    expect(buttons(w).map((b) => b.text)).toContain("DNS 다시 확인");
+
+    dnsTable["shop.example.com"] = ["198.51.100.7"];
+    await bot.handleUpdate(press(w, "DNS 다시 확인"));
+    w = wizard(sent);
+    expect(bodyOf(w)).toContain("다른 곳(<code>198.51.100.7</code>)을 가리키고 있어");
+
+    dnsTable["shop.example.com"] = ["104.21.91.175"];
+    await bot.handleUpdate(press(w, "DNS 다시 확인"));
+    expect(bodyOf(wizard(sent))).toContain("Cloudflare 프록시로 연결돼 있어");
+
+    dnsTable["shop.example.com"] = ["203.0.113.10"];
+    await bot.handleUpdate(press(wizard(sent), "DNS 다시 확인"));
+    expect(bodyOf(wizard(sent))).toContain("서버로 바로 연결돼 있어");
   });
 
   test("static choice uses the static builder on port 80 without a PORT env", async () => {
     const { bot, dk, sent, idle } = await setup();
-    await bot.handleUpdate(command("/deploy h053698/hello"));
+    await bot.handleUpdate(command("/deploy acme/hello"));
     await bot.handleUpdate(press(wizard(sent), "Static (nginx)"));
     await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)"));
-    await bot.handleUpdate(press(wizard(sent), "hello.arpa.page (추천)"));
+    await bot.handleUpdate(press(wizard(sent), "hello.example.test (추천)"));
     await bot.handleUpdate(press(wizard(sent), "배포하기"));
     await idle();
     expect(dk.calls.find((c) => c.path === "application.saveBuildType")?.body).toMatchObject({ buildType: "static", isStaticSpa: true });
@@ -425,17 +516,17 @@ describe("telegram flow", () => {
   test("a non-production environment gets its own default subdomain", async () => {
     const { bot, dk, sent } = await setup();
     dk.addProject("solix-web", ["production", "dev"]);
-    await bot.handleUpdate(command("/deploy h053698/hello"));
+    await bot.handleUpdate(command("/deploy acme/hello"));
     await bot.handleUpdate(railpack(sent));
     await bot.handleUpdate(press(wizard(sent), "solix-web"));
     await bot.handleUpdate(press(wizard(sent), "dev"));
-    expect(buttons(wizard(sent)).map((b) => b.text)).toContain("hello-dev.arpa.page (추천)");
+    expect(buttons(wizard(sent)).map((b) => b.text)).toContain("hello-dev.example.test (추천)");
   });
 
   test("existing project + new environment via button creates the environment there", async () => {
     const { bot, dk, sent, idle } = await setup();
     const project = dk.addProject("solix-web", ["production"]);
-    await bot.handleUpdate(command("/deploy h053698/hello"));
+    await bot.handleUpdate(command("/deploy acme/hello"));
     await bot.handleUpdate(railpack(sent));
     await bot.handleUpdate(press(wizard(sent), "solix-web"));
     let w = wizard(sent);
@@ -458,7 +549,7 @@ describe("telegram flow", () => {
   test("typed project, env and domain names are validated, normalized, and the prompt is cleaned up", async () => {
     const { bot, dk, sent, idle } = await setup();
     const project = dk.addProject("team-apps", ["production", "dev"]);
-    await bot.handleUpdate(command("/deploy h053698/hello"));
+    await bot.handleUpdate(command("/deploy acme/hello"));
     await bot.handleUpdate(railpack(sent));
     await bot.handleUpdate(press(wizard(sent), "이름 직접 입력"));
     const prompt = outbound(sent, forceReply);
@@ -478,12 +569,12 @@ describe("telegram flow", () => {
     expect(dk.paths()).not.toContain("project.create");
     expect(dk.paths()).not.toContain("environment.create");
     expect(dk.calls.find((c) => c.path === "application.create")?.body.environmentId).toBe(project.envs[1]?.environmentId);
-    expect(dk.calls.find((c) => c.path === "domain.create")?.body).toMatchObject({ host: "my-api.arpa.page" });
+    expect(dk.calls.find((c) => c.path === "domain.create")?.body).toMatchObject({ host: "my-api.example.test" });
   });
 
   test("in groups the typed-input prompt is a selective force reply that mentions the user", async () => {
     const { bot, sent } = await setup();
-    await bot.handleUpdate(command("/deploy h053698/hello", STRANGER_ID, group(GROUP_ID)));
+    await bot.handleUpdate(command("/deploy acme/hello", STRANGER_ID, group(GROUP_ID)));
     await bot.handleUpdate(press(wizard(sent), /Railpack/, STRANGER_ID, group(GROUP_ID)));
     await bot.handleUpdate(press(wizard(sent), "이름 직접 입력", STRANGER_ID, group(GROUP_ID)));
     const prompt = outbound(sent, forceReply);
@@ -493,7 +584,7 @@ describe("telegram flow", () => {
 
   test("another user cannot drive someone else's wizard; cancel ends it", async () => {
     const { bot, dk, sent } = await setup();
-    await bot.handleUpdate(command("/deploy h053698/hello", STRANGER_ID, group(GROUP_ID)));
+    await bot.handleUpdate(command("/deploy acme/hello", STRANGER_ID, group(GROUP_ID)));
     const w = wizard(sent);
     const data = buttons(w)[0]?.callback_data ?? "";
     await bot.handleUpdate(click(data, OWNER_ID, group(GROUP_ID)));
@@ -514,7 +605,7 @@ describe("telegram flow", () => {
     await bot.handleUpdate(command("/update hel"));
     const picker = outbound(sent, (s) => buttons(s).length > 0);
     expect(bodyOf(picker)).toContain("어떤 서비스를 업데이트할까?");
-    expect(buttons(picker).map((b) => b.text)).toEqual(["h053698/hello · production", "h053698/hello-api · staging"]);
+    expect(buttons(picker).map((b) => b.text)).toEqual(["acme/hello · production", "acme/hello-api · staging"]);
 
     await bot.handleUpdate(click(buttons(picker)[1]?.callback_data ?? ""));
     await idle();
@@ -566,7 +657,7 @@ describe("telegram flow", () => {
     const { bot, dk, sent } = await setup();
     const p = dk.addProject("team");
     dk.addApp("hello", p.envs[0]?.environmentId ?? "");
-    await bot.handleUpdate(command("/deploy https://github.com/h053698/hello"));
+    await bot.handleUpdate(command("/deploy https://github.com/acme/hello"));
     expect(wizard(sent)).toBeDefined();
     const shortcut = outbound(sent, (s) => bodyOf(s).includes("이미 1곳에 배포돼"));
     expect(buttons(shortcut).map((b) => b.callback_data)).toEqual([`run:u:a:id-hello-${p.envs[0]?.environmentId}`]);
@@ -576,7 +667,7 @@ describe("telegram flow", () => {
   test("every message of a deploy started inside a forum topic stays in that topic", async () => {
     const { bot, dk, sent, idle } = await setup();
     const inGroup = group(GROUP_ID);
-    await bot.handleUpdate(command("/deploy h053698/hello", OWNER_ID, inGroup, true));
+    await bot.handleUpdate(command("/deploy acme/hello", OWNER_ID, inGroup, true));
     let w = wizard(sent);
     await bot.handleUpdate(press(w, /Railpack/, OWNER_ID, inGroup, true));
     await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)", OWNER_ID, inGroup, true));
@@ -592,7 +683,7 @@ describe("telegram flow", () => {
   test("a deploy started in General (no topic) sends no thread id", async () => {
     const { bot, sent, idle } = await setup();
     const inGroup = group(GROUP_ID);
-    await bot.handleUpdate(command("/deploy h053698/hello", OWNER_ID, inGroup));
+    await bot.handleUpdate(command("/deploy acme/hello", OWNER_ID, inGroup));
     await bot.handleUpdate(press(wizard(sent), /Railpack/, OWNER_ID, inGroup));
     await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)", OWNER_ID, inGroup));
     await bot.handleUpdate(press(wizard(sent), "도메인 없이", OWNER_ID, inGroup));
@@ -605,14 +696,14 @@ describe("telegram flow", () => {
 
   test("any member of an allowed group can use the bot there", async () => {
     const { bot, dk, sent } = await setup();
-    await bot.handleUpdate(command("/deploy@deploy_bot https://github.com/h053698/hello", STRANGER_ID, group(GROUP_ID)));
+    await bot.handleUpdate(command("/deploy@deploy_bot https://github.com/acme/hello", STRANGER_ID, group(GROUP_ID)));
     expect(bodyOf(wizard(sent))).toContain("어떻게 빌드할까?");
     expect(dk.paths()).toContain("project.all");
   });
 
   test("other groups are rejected even for allowed users, and the reply shows the group id", async () => {
     const { bot, dk, sent } = await setup();
-    await bot.handleUpdate(command("/deploy https://github.com/h053698/hello", OWNER_ID, group(OTHER_GROUP_ID)));
+    await bot.handleUpdate(command("/deploy https://github.com/acme/hello", OWNER_ID, group(OTHER_GROUP_ID)));
     expect(bodyOf(sent[0])).toContain(String(OTHER_GROUP_ID));
     expect(dk.calls).toEqual([]);
   });
@@ -625,7 +716,7 @@ describe("telegram flow", () => {
 
   test("unauthorized users are rejected and nothing reaches Dokploy", async () => {
     const { bot, dk, sent } = await setup();
-    await bot.handleUpdate(command("/deploy https://github.com/h053698/hello", STRANGER_ID));
+    await bot.handleUpdate(command("/deploy https://github.com/acme/hello", STRANGER_ID));
     await bot.handleUpdate(click("run:u:a:id-hello", STRANGER_ID));
     expect(bodyOf(sent[0])).toContain(String(STRANGER_ID));
     expect(sent.find((s) => s.method === "answerCallbackQuery")?.payload).toMatchObject({ text: "권한 없음" });
@@ -639,9 +730,9 @@ describe("telegram flow", () => {
 
     await bot.handleUpdate(command(`/allow ${STRANGER_ID}`, ADMIN_ID));
     expect(bodyOf(sent.at(-1))).toContain("허용했어");
-    expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID] });
+    expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID], chats: [] });
 
-    const reloaded = await Access.load(accessFile, cfg.allowedUserIds, cfg.adminUserIds);
+    const reloaded = await Access.load(accessFile, cfg.allowedUserIds, cfg.adminUserIds, cfg.allowedChatIds);
     expect(reloaded.isUser(STRANGER_ID)).toBe(true);
 
     await bot.handleUpdate(command("/list", STRANGER_ID));
@@ -649,7 +740,7 @@ describe("telegram flow", () => {
     expect(lastWith(sent, (s) => s.method === "sendRichMessage" || s.method === "sendMessage")).toBeDefined();
 
     await bot.handleUpdate(command(`/disallow ${STRANGER_ID}`, ADMIN_ID));
-    expect(await Bun.file(accessFile).json()).toEqual({ users: [] });
+    expect(await Bun.file(accessFile).json()).toEqual({ users: [], chats: [] });
     const callsBefore = dk.calls.length;
     await bot.handleUpdate(command("/list", STRANGER_ID));
     expect(dk.calls.length).toBe(callsBefore);
@@ -668,7 +759,7 @@ describe("telegram flow", () => {
     update.message.reply_to_message = { message_id: 1, date: 0, chat: group(GROUP_ID), from: from(STRANGER_ID), text: "hi", reply_to_message: undefined };
     await bot.handleUpdate(update);
     expect(bodyOf(sent.at(-1))).toContain(`${STRANGER_ID} 허용했어`);
-    expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID] });
+    expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID], chats: [] });
   });
 
   test("denied DM notifies admins once with an approve button that grants access", async () => {
@@ -684,11 +775,59 @@ describe("telegram flow", () => {
     expect(await Bun.file(accessFile).exists()).toBe(false);
 
     await bot.handleUpdate(click(approve?.callback_data ?? "", ADMIN_ID));
-    expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID] });
+    expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID], chats: [] });
     const settled = lastWith(sent, (s) => s.method === "editMessageText");
     expect(bodyOf(settled)).toContain("허용함");
     expect(buttons(settled)).toEqual([]);
     expect(sent.at(-1)).toMatchObject({ payload: { chat_id: STRANGER_ID } });
     expect(isOutbound(sent.at(-1) as Sent)).toBe(true);
+  });
+
+  test("an admin can allow and revoke a group from inside it, and the choice survives a reload", async () => {
+    const { bot, sent, accessFile, cfg } = await setup();
+    await bot.handleUpdate(command("/list", STRANGER_ID, group(OTHER_GROUP_ID)));
+    expect(bodyOf(outbound(sent))).toContain(String(OTHER_GROUP_ID));
+
+    await bot.handleUpdate(command("/allowgroup", OWNER_ID, group(OTHER_GROUP_ID)));
+    expect(bodyOf(outbound(sent))).toContain("이 그룹에서는 쓸 수 없어");
+    expect(await Bun.file(accessFile).exists()).toBe(false);
+    await bot.handleUpdate(command("/allowgroup", OWNER_ID, group(GROUP_ID)));
+    expect(bodyOf(outbound(sent))).toContain("관리자만");
+    expect(await Bun.file(accessFile).exists()).toBe(false);
+
+    await bot.handleUpdate(command("/allowgroup", ADMIN_ID, group(OTHER_GROUP_ID)));
+    expect(bodyOf(outbound(sent))).toContain("그룹을 허용했어");
+    expect(await Bun.file(accessFile).json()).toEqual({ users: [], chats: [OTHER_GROUP_ID] });
+
+    await bot.handleUpdate(command("/deploy acme/hello", STRANGER_ID, group(OTHER_GROUP_ID)));
+    expect(wizard(sent)).toBeDefined();
+
+    const reloaded = await Access.load(accessFile, cfg.allowedUserIds, cfg.adminUserIds, cfg.allowedChatIds);
+    expect(reloaded.isChatAllowed(OTHER_GROUP_ID)).toBe(true);
+    expect(reloaded.isChatAllowed(GROUP_ID)).toBe(true);
+
+    await bot.handleUpdate(command(`/disallowgroup ${GROUP_ID}`, ADMIN_ID));
+    expect(bodyOf(outbound(sent))).toContain("ALLOWED_CHAT_IDS");
+    await bot.handleUpdate(command(`/disallowgroup ${OTHER_GROUP_ID}`, ADMIN_ID));
+    expect(bodyOf(outbound(sent))).toContain("허용을 취소했어");
+    expect(await Bun.file(accessFile).json()).toEqual({ users: [], chats: [] });
+  });
+
+  test("a custom domain behind Cloudflare is created without https, and a directly connected one gets Let's Encrypt", async () => {
+    for (const [ip, expected] of [
+      ["104.21.91.175", { https: false, certificateType: "none" }],
+      ["203.0.113.10", { https: true, certificateType: "letsencrypt" }],
+    ] as const) {
+      const { bot, dk, sent, idle } = await setup();
+      dnsTable["shop.example.org"] = [ip];
+      await bot.handleUpdate(command("/deploy acme/hello"));
+      await bot.handleUpdate(railpack(sent));
+      await bot.handleUpdate(press(wizard(sent), /^새 프로젝트/));
+      await bot.handleUpdate(press(wizard(sent), "직접 입력"));
+      await bot.handleUpdate(reply("shop.example.org"));
+      await bot.handleUpdate(press(wizard(sent), "배포하기"));
+      await idle();
+      expect(dk.calls.find((c) => c.path === "domain.create")?.body).toMatchObject({ host: "shop.example.org", ...expected });
+    }
   });
 });

@@ -1,6 +1,7 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import { BUILD_LABELS, type BuildChoice, type BuildOptions, type BuildPlan, buildOptions, normalizeDomain, planFor, subdomainFor } from "./analyze.ts";
 import type { Access } from "./access.ts";
+import type { DnsReport } from "./dns.ts";
 import { type Config, publicUrl } from "./config.ts";
 import type { Deployer, DeployResult, ManagedService, ProjectInfo, Reporter, RunOutcome, Target } from "./deployer.ts";
 import { type GitHub, parseRepoUrl, type RepoInfo, repoKey } from "./github.ts";
@@ -37,7 +38,9 @@ interface Wizard {
   awaiting: Awaiting;
   target: Target | null;
   domain: string | null | undefined;
-  dnsOk: boolean | null;
+  dns: (DnsReport & { serverIps: string[] }) | null;
+  taken: Set<string>;
+  suggested?: { env: string; host: string; plainTaken: string | null };
   createdAt: number;
 }
 
@@ -191,12 +194,11 @@ export function whereOf(ctx: Context): Place {
 export function isAllowed(
   chat: { id: number; type: string } | undefined,
   userId: number | undefined,
-  access: Pick<Access, "isUser">,
-  allowedChatIds: ReadonlySet<number>,
+  access: Pick<Access, "isUser" | "isChatAllowed">,
 ): boolean {
   if (!chat || userId === undefined) return false;
   if (chat.type === "private") return access.isUser(userId);
-  if (chat.type === "group" || chat.type === "supergroup") return allowedChatIds.has(chat.id);
+  if (chat.type === "group" || chat.type === "supergroup") return access.isChatAllowed(chat.id);
   return false;
 }
 
@@ -240,11 +242,44 @@ function stepBar(step: Step): string {
   return STEPS.map((s, i) => (i < at ? `✓ ${s.label}` : i === at ? `<b>● ${s.label}</b>` : `○ ${s.label}`)).join("  ");
 }
 
-const defaultDomain = (w: Wizard, baseDomain: string) => {
-  const env = w.target?.environmentName;
+const randomDigits = () => String(1000 + Math.floor(Math.random() * 9000));
+
+export function freeHost(label: string, baseDomain: string, taken: ReadonlySet<string>): string {
+  let host = `${label}.${baseDomain}`;
+  while (taken.has(host)) host = `${label.slice(0, 58)}-${randomDigits()}.${baseDomain}`;
+  return host;
+}
+
+export function alternativeFor(host: string, taken: ReadonlySet<string>): string {
+  const [label = "app", ...rest] = host.split(".");
+  return freeHost(label, rest.join("."), new Set([...taken, host]));
+}
+
+function suggestDomain(w: Wizard, baseDomain: string): string {
+  const env = w.target?.environmentName ?? "";
+  if (w.suggested?.env === env) return w.suggested.host;
   const slug = subdomainFor(w.repo.repo);
-  return `${env && env !== "production" ? `${slug}-${subdomainFor(env)}` : slug}.${baseDomain}`;
-};
+  const label = env && env !== "production" ? `${slug}-${subdomainFor(env)}` : slug;
+  const plain = `${label}.${baseDomain}`;
+  const host = freeHost(label, baseDomain, w.taken);
+  w.suggested = { env, host, plainTaken: host === plain ? null : plain };
+  return host;
+}
+
+export function dnsLines(host: string, dns: DnsReport & { serverIps: string[] }, tls: Config["domainTls"]): string[] {
+  const ip = dns.serverIps.join(", ") || "서버 IP";
+  const guide = [
+    "직접 연결: DNS에서 A 레코드를 서버 IP로 설정해",
+    `  ${code(host)} → ${code(ip)}`,
+    "Cloudflare 사용: 같은 A 레코드에 프록시(주황 구름)를 켜고 SSL/TLS 모드를 Flexible로 해",
+  ];
+  if (dns.state === "direct") {
+    return [tls === "none" ? "DNS 확인: 서버로 바로 연결돼 있어 (HTTP로 열려)" : "DNS 확인: 서버로 바로 연결돼 있어. Let's Encrypt 인증서로 HTTPS를 설정해"];
+  }
+  if (dns.state === "cloudflare") return ["DNS 확인: Cloudflare 프록시로 연결돼 있어. SSL/TLS 모드를 Flexible로 맞춰줘 (서버에는 HTTP로 전달돼)"];
+  if (dns.state === "other") return [`DNS 확인: ${code(host)}가 다른 곳(${code(dns.addresses.join(", "))})을 가리키고 있어`, ...guide];
+  return [`DNS 확인: ${code(host)}가 아직 설정되지 않았어`, ...guide];
+}
 
 export function wizardText(w: Wizard, cfg: Pick<Config, "domainTls" | "railpackVersion">): string {
   const lines = [`${bold(`${w.repo.owner}/${w.repo.repo}`)} · ${code(w.repo.defaultBranch)}`, "", stepBar(w.step), ""];
@@ -257,14 +292,17 @@ export function wizardText(w: Wizard, cfg: Pick<Config, "domainTls" | "railpackV
     lines.push(`도메인 ${w.domain ? code(publicUrl(cfg, w.domain)) : "없음"}`);
   }
   for (const warning of w.plan.warnings) lines.push(`${esc(warning)}`);
-  if (w.domain && w.dnsOk === false) lines.push(`${code(w.domain)} DNS가 아직 안 잡혀 있어. 서버 IP로 A 레코드를 걸어야 접속돼`);
+  if (w.domain && w.dns) lines.push(...dnsLines(w.domain, w.dns, cfg.domainTls));
   if (w.step === "build") {
     lines.push(`감지: ${describePlan(w.options.detected, cfg.railpackVersion)}`);
     lines.push("어떻게 빌드할까?");
   }
   if (w.step === "project") lines.push("", w.awaiting === "project" ? "새 프로젝트 이름을 답장으로 보내줘" : "어느 Dokploy 프로젝트에 올릴까?");
   if (w.step === "env") lines.push("", w.awaiting === "env" ? "새 환경 이름을 답장으로 보내줘" : "어느 환경(environment)에 올릴까?");
-  if (w.step === "domain") lines.push("", w.awaiting === "domain" ? "도메인을 답장으로 보내줘" : "도메인은 어떻게 할까?");
+  if (w.step === "domain") {
+    if (w.suggested?.plainTaken) lines.push("", `${code(w.suggested.plainTaken)}는 이미 쓰는 중이라 ${code(w.suggested.host)}를 추천해`);
+    lines.push("", w.awaiting === "domain" ? "도메인을 답장으로 보내줘" : "도메인은 어떻게 할까?");
+  }
   if (w.step === "confirm") lines.push("", "이대로 올릴까?");
   return lines.join("\n");
 }
@@ -412,6 +450,12 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     }
   };
 
+  const loadTaken = () =>
+    deployer.usedHosts().catch((error: unknown) => {
+      console.warn("[deploy-bot] could not read used domains, skipping the duplicate check:", error instanceof Error ? error.message : error);
+      return new Set<string>();
+    });
+
   const prune = () => {
     const now = Date.now();
     for (const [token, w] of wizards) if (now - w.createdAt > WIZARD_TTL_MS) wizards.delete(token);
@@ -433,7 +477,9 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
   bot.use(async (ctx, next) => {
     const id = ctx.from?.id;
     const isCommand = ctx.message?.entities?.[0]?.type === "bot_command" && ctx.message.entities[0].offset === 0;
-    if (isAllowed(ctx.chat, id, access, cfg.allowedChatIds)) {
+    const command = isCommand ? ctx.message?.text?.split(/[\s@]/)[0] : undefined;
+    const adminGroupCommand = command === "/allowgroup" && access.isAdmin(id) && ctx.chat?.type !== "private";
+    if (isAllowed(ctx.chat, id, access) || adminGroupCommand) {
       if (isCommand) console.log(`[deploy-bot] cmd ${ctx.message?.text?.split(" ")[0]} chat=${ctx.chat?.id} user=${id}`);
       return next();
     }
@@ -462,7 +508,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
         "",
         "<i>레포 이름은 일부만 쳐도 되고, 비워두면 버튼으로 골라.</i>",
         ...(access.isAdmin(ctx.from?.id)
-          ? ["", "<b>관리자</b>", "/allow <code>&lt;유저ID&gt;</code> DM 허용 (그룹에서 답장으로 /allow 도 됨)", "/disallow <code>&lt;유저ID&gt;</code> 허용 취소", "/allowed 허용 목록"]
+          ? ["", "<b>관리자</b>", "/allow <code>&lt;유저ID&gt;</code> DM 허용 (그룹에서 답장으로 /allow 도 됨)", "/disallow <code>&lt;유저ID&gt;</code> 허용 취소", "/allowed 허용 목록", "/allowgroup <code>[그룹ID]</code> 그룹 허용 (그룹 안에서는 ID 없이 쓰면 그 그룹)", "/disallowgroup <code>&lt;그룹ID&gt;</code> 그룹 허용 취소"]
           : []),
       ].join("\n"),
     ),
@@ -505,12 +551,41 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
 
   bot.command("allowed", async (ctx) => {
     if (!(await adminOnly(ctx))) return;
-    const { admins, env, added } = access.list();
+    const { admins, env, added, envChats, addedChats } = access.list();
     const fmt = (ids: number[]) => (ids.length ? ids.join(", ") : "없음");
     return notice(
       ctx,
-      [`관리자: ${fmt(admins)}`, `.env 허용: ${fmt(env)}`, `봇으로 추가: ${fmt(added)}`, `허용 그룹: ${fmt([...cfg.allowedChatIds])}`].join("\n"),
+      [`관리자: ${fmt(admins)}`, `.env 허용: ${fmt(env)}`, `봇으로 추가: ${fmt(added)}`, `허용 그룹(.env): ${fmt(envChats)}`, `봇으로 추가한 그룹: ${fmt(addedChats)}`].join("\n"),
     );
+  });
+
+  const parseChatId = (text: string) => {
+    const id = Number(text.trim());
+    return text.trim() && Number.isSafeInteger(id) && id !== 0 ? id : null;
+  };
+
+  bot.command("allowgroup", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const arg = ctx.match.trim();
+    const target = arg ? parseChatId(arg) : ctx.chat.type === "private" ? null : ctx.chat.id;
+    if (target === null) return notice(ctx, "사용법: /allowgroup &lt;그룹ID&gt; (허용할 그룹 안에서는 ID 없이 /allowgroup 만 쳐도 돼)");
+    const result = await access.addChat(target);
+    console.log(`[deploy-bot] allowgroup chat=${target} by=${ctx.from?.id} result=${result}`);
+    return notice(ctx, result === "added" ? `${target} 그룹을 허용했어. 이제 그 그룹의 모든 멤버가 봇을 쓸 수 있어` : `${target}는 이미 허용된 그룹이야`);
+  });
+
+  bot.command("disallowgroup", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const target = parseChatId(ctx.match);
+    if (target === null) return notice(ctx, "사용법: /disallowgroup &lt;그룹ID&gt;");
+    const result = await access.removeChat(target);
+    console.log(`[deploy-bot] disallowgroup chat=${target} by=${ctx.from?.id} result=${result}`);
+    const messages = {
+      removed: `${target} 그룹 허용을 취소했어`,
+      env: `${target}는 .env의 ALLOWED_CHAT_IDS에 있어서 봇에서는 못 빼. .env에서 지우고 재시작해줘`,
+      missing: `${target}는 허용된 그룹이 아니야`,
+    } as const;
+    return notice(ctx, messages[result]);
   });
 
   bot.callbackQuery(/^acl:(add|ignore):(\d+)$/, async (ctx) => {
@@ -580,15 +655,17 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     }
     if (w.step === "domain") {
       return [
-        [cb(`${defaultDomain(w, cfg.baseDomain)} (추천)`, "dsug", "primary")],
+        [cb(`${suggestDomain(w, cfg.baseDomain)} (추천)`, "dsug", "primary")],
         [cb("직접 입력", "dtype"), cb("도메인 없이", "dnone")],
         [cb("뒤로", "back:env"), cancel],
       ];
     }
-    return [[cb("배포하기", "go", "success")], [cb("뒤로", "back:domain"), cancel]];
+    const recheck = w.domain && isCustom(w.domain) ? [cb("DNS 다시 확인", "dnscheck")] : [];
+    return [[cb("배포하기", "go", "success"), ...recheck], [cb("뒤로", "back:domain"), cancel]];
   };
 
   const render = async (ctx: Context, token: string, w: Wizard, frozen: string | null = null) => {
+    if (w.step === "domain") suggestDomain(w, cfg.baseDomain);
     const rows: RichButton[][] = frozen ? [[{ label: frozen, disabled: true }]] : wizardRows(token, w);
     try {
       await ctx.api.editMessageText(w.place.chatId, w.messageId, { html: toRich(wizardText(w, cfg)) + richRows(rows) });
@@ -614,7 +691,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     const statusId = await say(ctx, `${bold(`${ref.owner}/${ref.repo}`)} 분석 중...`);
     await ctx.replyWithChatAction("typing").catch(() => undefined);
     try {
-      const [repo, projects, existing] = await Promise.all([gh.repo(ref), deployer.listProjects(), deployer.findByRepo(ref)]);
+      const [repo, projects, existing, taken] = await Promise.all([gh.repo(ref), deployer.listProjects(), deployer.findByRepo(ref), loadTaken()]);
       const files = await gh.treeBlobs(repo, repo.defaultBranch);
       const options = await buildOptions(files, (path) => gh.fileOrNull(repo, repo.defaultBranch, path));
 
@@ -635,7 +712,8 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
         awaiting: null,
         target: null,
         domain: undefined,
-        dnsOk: null,
+        dns: null,
+        taken,
         createdAt: Date.now(),
       };
       wizards.set(token, w);
@@ -668,9 +746,11 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     w.awaiting = null;
   };
 
+  const isCustom = (host: string) => !host.endsWith(`.${cfg.baseDomain}`);
+
   const chooseDomain = async (w: Wizard, domain: string | null) => {
     w.domain = domain;
-    w.dnsOk = domain && cfg.domainTls === "letsencrypt" ? await deployer.domainResolves(domain) : null;
+    w.dns = domain && isCustom(domain) ? await deployer.dnsReport(domain).catch(() => null) : null;
     w.step = "confirm";
     w.awaiting = null;
   };
@@ -727,7 +807,13 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
       if (!name) return ctx.answerCallbackQuery({ text: "환경 이름이 이상해" });
       w.target = { ...w.target, environmentId: null, environmentName: name };
       w.step = "domain";
-    } else if (action === "dsug") await chooseDomain(w, defaultDomain(w, cfg.baseDomain));
+    } else if (action === "dnscheck") {
+      if (!w.domain) return ctx.answerCallbackQuery({ text: "확인할 도메인이 없어" });
+      w.dns = await deployer.dnsReport(w.domain).catch(() => null);
+      await ctx.answerCallbackQuery({ text: w.dns ? "다시 확인했어" : "DNS 조회에 실패했어" });
+      await render(ctx, token, w);
+      return;
+    } else if (action === "dsug") await chooseDomain(w, suggestDomain(w, cfg.baseDomain));
     else if (action === "dnone") await chooseDomain(w, null);
     else if (action === "ptype" || action === "etype" || action === "dtype") {
       w.awaiting = action === "ptype" ? "project" : action === "etype" ? "env" : "domain";
@@ -770,6 +856,9 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     } else if (w.awaiting === "domain") {
       const domain = normalizeDomain(text, cfg.baseDomain);
       if (!domain) return say(ctx, `도메인 형식이 이상해. 다시 보내줘 (예: myapp.${cfg.baseDomain})`);
+      if (w.taken.has(domain)) {
+        return say(ctx, `${code(domain)}는 이미 쓰는 도메인이야. 다른 걸 보내줘 (예: ${code(alternativeFor(domain, w.taken))})`);
+      }
       await chooseDomain(w, domain);
     }
     w.awaiting = null;
@@ -792,16 +881,30 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
       await notice(ctx, `${esc(key)}는 이미 배포 중이야`);
       return;
     }
+    if (w.domain) {
+      w.taken = await loadTaken();
+      if (isCustom(w.domain)) w.dns = await deployer.dnsReport(w.domain).catch(() => w.dns);
+      if (w.taken.has(w.domain)) {
+        const lost = w.domain;
+        w.suggested = undefined;
+        w.domain = undefined;
+        w.step = "domain";
+        await render(ctx, token, w);
+        await notice(ctx, `${code(lost)}를 방금 다른 서비스가 쓰기 시작했어. 도메인을 다시 골라줘`);
+        return;
+      }
+    }
     wizards.delete(token);
     const target = w.target;
     const domain = w.domain ?? null;
+    const dnsState = domain && isCustom(domain) ? (w.dns?.state ?? null) : null;
     await freezeWizard(ctx, token, w, "배포 진행 중...");
     busy.add(key);
     background(ctx, async () => {
       let label = "배포 실패";
       try {
         const live = new LiveStatus(ctx.api, w.place, `${bold(key)} → ${esc(`${target.projectName} / ${target.environmentName}`)}`);
-        const result = await deployer.deploy({ repo: w.repo, files: w.files, plan: w.plan, domain, target }, live);
+        const result = await deployer.deploy({ repo: w.repo, files: w.files, plan: w.plan, domain, target, dns: dnsState }, live);
         label = result.status === "done" ? "배포 완료" : "배포 실패";
         await finishRun(ctx, w.place, live, result);
       } finally {
