@@ -10,21 +10,22 @@ A Telegram bot that deploys GitHub repos to Dokploy with one command.
    - `docker-compose.yml` / `compose.yaml` → Dokploy Compose (the domain attaches to the `web`/`app`/`frontend`… service, or to the first service that has ports)
    - `Dockerfile` → Dockerfile build (port taken from `EXPOSE`)
    - Neither → **Railpack**. If the Railpack build fails, an AI writes a Dockerfile, the bot injects it as `Dockerfile.deploy-bot` through a Dokploy Patch, and the build is retried.
-2. It asks which domain to use: default `<repo>.arpa.page`, enter your own, or no domain.
-3. It posts a summary of how the service will be set up, then creates the project/app/domain in Dokploy and deploys.
-4. Progress shows up as a single message that keeps updating. At the end you get the URL, or a failure with the tail of the log.
+2. A single message walks you through the choices with buttons: **project** (suggests a new project named after the repo, or pick an existing one, or type a name) → **environment** (existing ones, `+ staging` / `+ dev`, or type a name; missing ones are created) → **domain** (`<repo>.arpa.page`, your own, or none) → **confirm**.
+3. After you press 🚀, one live message shows each step and the last lines of the build log while it runs.
+4. The result message has buttons: open the site, open it in Dokploy, copy the URL, full build log, runtime log, update, rebuild. Failures show the end of the build log in a collapsible block.
 
 | Command | What it does |
 |---|---|
 | `/deploy <url>` | New deploy. If the repo is already deployed, shows update/rebuild buttons instead |
 | `/update [name]` | Pulls the latest GitHub code and deploys again (Dokploy `deploy`) |
 | `/redeploy [name]` | Rebuilds the already-cloned code without pulling (Dokploy `redeploy`) |
-| `/list` | Lists services the bot manages |
+| `/logs [name]` | Shows the running service's recent logs (with a refresh button) |
+| `/list` | Lists bot-managed services grouped by project / environment |
 | `/allow <user id>` | Admin only. Lets that user use the bot in DMs. In a group you can also reply to the person's message with `/allow` |
 | `/disallow <user id>` | Admin only. Removes a user added with `/allow` |
 | `/allowed` | Admin only. Shows admins, allowed users, and allowed groups |
 
-A partial or empty name brings up buttons to choose from. Only services the bot created (description `deploy-bot repo:owner/repo`, inside the `DOKPLOY_PROJECT` project) are managed.
+A partial or empty name brings up buttons to choose from. The bot manages every service it created (description `deploy-bot repo:owner/repo`) in any project or environment. The same repo can live in several environments; pickers show which one.
 
 ## Setup
 

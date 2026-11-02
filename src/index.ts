@@ -21,6 +21,7 @@ const { bot } = createBot({ cfg, access, deployer: new Deployer(cfg, dk, gh), gh
 const acl = access.list();
 console.log(`[deploy-bot] admins=${acl.admins.length} users=${acl.env.length}+${acl.added.length} groups=${cfg.allowedChatIds.size} (${cfg.accessFile})`);
 if (acl.admins.length === 0) console.warn("[deploy-bot] ADMIN_USER_IDS is empty: nobody can use /allow.");
+console.log(`[deploy-bot] ai=${cfg.ai ? cfg.ai.providers.map((p) => `${p.name}:${p.model}`).join(" > ") : "off"}`);
 
 const server = Bun.serve({
   port: Number(process.env.PORT ?? 3000),

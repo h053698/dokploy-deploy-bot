@@ -2,16 +2,7 @@ import { lookup } from "node:dns/promises";
 import { generateDockerfile } from "./ai.ts";
 import type { BuildPlan } from "./analyze.ts";
 import type { Config } from "./config.ts";
-import type {
-  DkDeployment,
-  DkDomain,
-  DkGithubProvider,
-  DkGithubRepo,
-  DkPatch,
-  DkProject,
-  Dokploy,
-  FetchLike,
-} from "./dokploy.ts";
+import type { DkDeployment, DkDomain, DkGithubProvider, DkGithubRepo, DkPatch, Dokploy, FetchLike } from "./dokploy.ts";
 import { type GitHub, type RepoInfo, type RepoRef, repoKey } from "./github.ts";
 
 export type ServiceKind = "application" | "compose";
@@ -23,6 +14,23 @@ export interface ManagedService {
   appName: string;
   repo: string;
   status: string;
+  projectId: string;
+  projectName: string;
+  environmentId: string;
+  environmentName: string;
+}
+
+export interface ProjectInfo {
+  projectId: string;
+  name: string;
+  environments: { environmentId: string; name: string; isDefault: boolean }[];
+}
+
+export interface Target {
+  projectId: string | null;
+  projectName: string;
+  environmentId: string | null;
+  environmentName: string;
 }
 
 export interface DeployRequest {
@@ -30,21 +38,32 @@ export interface DeployRequest {
   files: string[];
   plan: BuildPlan;
   domain: string | null;
+  target: Target;
 }
 
-export interface DeployResult {
+export type RunStatus = "done" | "error" | "cancelled" | "timeout";
+
+export interface RunOutcome {
+  status: RunStatus;
+  logTail: string | null;
+  deploymentId: string | null;
+}
+
+export interface DeployResult extends RunOutcome {
   service: ManagedService;
-  status: "done" | "error" | "cancelled" | "timeout";
   url: string | null;
   usedAiDockerfile: boolean;
-  logTail: string | null;
 }
 
-export type Progress = (line: string) => Promise<void> | void;
+export interface Reporter {
+  step(line: string): Promise<void> | void;
+  log?(tail: string): Promise<void> | void;
+}
 
 const AI_DOCKERFILE = "Dockerfile.deploy-bot";
 const MARKER = "deploy-bot repo:";
 const TERMINAL = new Set(["done", "error", "cancelled"]);
+const LIVE_LOG_LINES = 12;
 
 export const describeService = (repo: RepoRef) => `${MARKER}${repoKey(repo)}`;
 
@@ -71,6 +90,27 @@ const resolvesViaDns = async (host: string) => {
   }
 };
 
+interface SearchPage<T> {
+  items: T[];
+  total: number;
+}
+interface SearchApp {
+  applicationId: string;
+  name: string;
+  appName: string;
+  description: string | null;
+  environmentId: string;
+  applicationStatus: string;
+}
+interface SearchCompose {
+  composeId: string;
+  name: string;
+  appName: string;
+  description: string | null;
+  environmentId: string;
+  composeStatus: string;
+}
+
 export class Deployer {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
@@ -89,45 +129,46 @@ export class Deployer {
     this.aiFetch = hooks.aiFetch ?? fetch;
   }
 
-  private async findProject(): Promise<DkProject | null> {
-    const projects = await this.dk.get<DkProject[]>("project.all");
-    return projects.find((p) => p.name === this.cfg.dokployProject) ?? null;
-  }
-
-  private async environmentId(): Promise<string> {
-    const project = await this.findProject();
-    if (project) {
-      const env = project.environments.find((e) => e.isDefault) ?? project.environments[0];
-      if (env) return env.environmentId;
-    }
-    const created = await this.dk.post<{ environment: { environmentId: string } }>("project.create", {
-      name: this.cfg.dokployProject,
-      description: "Telegram deploy bot managed services",
-    });
-    return created.environment.environmentId;
+  async listProjects(): Promise<ProjectInfo[]> {
+    const projects = await this.dk.get<ProjectInfo[]>("project.all");
+    return projects.map((p) => ({
+      projectId: p.projectId,
+      name: p.name,
+      environments: p.environments.map((e) => ({ environmentId: e.environmentId, name: e.name, isDefault: e.isDefault })),
+    }));
   }
 
   async listManaged(): Promise<ManagedService[]> {
-    const summary = await this.findProject();
-    if (!summary) return [];
-    const project = await this.dk.get<DkProject>("project.one", { projectId: summary.projectId });
+    const [projects, apps, composes] = await Promise.all([
+      this.listProjects(),
+      this.dk.get<SearchPage<SearchApp>>("application.search", { description: MARKER, limit: 100 }),
+      this.dk.get<SearchPage<SearchCompose>>("compose.search", { description: MARKER, limit: 100 }),
+    ]);
+    const envIndex = new Map<string, { projectId: string; projectName: string; environmentName: string }>();
+    for (const p of projects) {
+      for (const e of p.environments) envIndex.set(e.environmentId, { projectId: p.projectId, projectName: p.name, environmentName: e.name });
+    }
+    const where = (environmentId: string) =>
+      envIndex.get(environmentId) ?? { projectId: "", projectName: "?", environmentName: "?" };
     const services: ManagedService[] = [];
-    for (const env of project.environments) {
-      for (const a of env.applications) {
-        const repo = repoFromDescription(a.description);
-        if (repo) services.push({ kind: "application", id: a.applicationId, name: a.name, appName: a.appName, repo, status: a.applicationStatus });
+    for (const a of apps.items) {
+      const repo = repoFromDescription(a.description);
+      if (repo) {
+        services.push({ kind: "application", id: a.applicationId, name: a.name, appName: a.appName, repo, status: a.applicationStatus, environmentId: a.environmentId, ...where(a.environmentId) });
       }
-      for (const c of env.compose) {
-        const repo = repoFromDescription(c.description);
-        if (repo) services.push({ kind: "compose", id: c.composeId, name: c.name, appName: c.appName, repo, status: c.composeStatus });
+    }
+    for (const c of composes.items) {
+      const repo = repoFromDescription(c.description);
+      if (repo) {
+        services.push({ kind: "compose", id: c.composeId, name: c.name, appName: c.appName, repo, status: c.composeStatus, environmentId: c.environmentId, ...where(c.environmentId) });
       }
     }
     return services;
   }
 
-  async findByRepo(ref: RepoRef): Promise<ManagedService | null> {
+  async findByRepo(ref: RepoRef): Promise<ManagedService[]> {
     const key = repoKey(ref);
-    return (await this.listManaged()).find((s) => s.repo === key) ?? null;
+    return (await this.listManaged()).filter((s) => s.repo === key);
   }
 
   domainResolves(host: string): Promise<boolean> {
@@ -140,6 +181,34 @@ export class Deployer {
       : this.dk.get<DkDomain[]>("domain.byComposeId", { composeId: service.id });
   }
 
+  dashboardUrl(service: Pick<ManagedService, "kind" | "id" | "projectId" | "environmentId">): string {
+    return `${this.cfg.dokployUrl}/dashboard/project/${service.projectId}/environment/${service.environmentId}/services/${service.kind}/${service.id}`;
+  }
+
+  async buildLog(deploymentId: string, tail = 80): Promise<string | null> {
+    const text = await this.dk.get<string>("deployment.readLogs", { deploymentId, tail }).catch(() => null);
+    return typeof text === "string" && text.trim() ? text : null;
+  }
+
+  async runtimeLog(service: ManagedService, tail = 200): Promise<string | null> {
+    if (service.kind === "application") {
+      const text = await this.dk.get<string>("application.readLogs", { applicationId: service.id, tail });
+      return typeof text === "string" && text.trim() ? text : null;
+    }
+    const containers = await this.dk.get<{ containerId: string; name: string }[]>("docker.getContainersByAppNameMatch", {
+      appName: service.appName,
+      appType: "docker-compose",
+    });
+    const parts = await Promise.all(
+      containers.slice(0, 3).map(async (c) => {
+        const text = await this.dk.get<string>("compose.readLogs", { composeId: service.id, containerId: c.containerId, tail });
+        return typeof text === "string" && text.trim() ? `===== ${c.name} =====\n${text}` : "";
+      }),
+    );
+    const joined = parts.filter(Boolean).join("\n\n");
+    return joined || null;
+  }
+
   private async githubAppId(repo: RepoRef): Promise<string | null> {
     const providers = await this.dk.get<DkGithubProvider[]>("github.githubProviders");
     for (const provider of providers) {
@@ -149,6 +218,40 @@ export class Deployer {
       if (repos.some((r) => repoKey({ owner: r.owner.login, repo: r.name }) === repoKey(repo))) return provider.githubId;
     }
     return null;
+  }
+
+  private async resolveTarget(target: Target, reporter: Reporter) {
+    const projects = await this.listProjects();
+    let project = target.projectId
+      ? projects.find((p) => p.projectId === target.projectId)
+      : projects.find((p) => p.name === target.projectName);
+    if (target.projectId && !project) throw new Error(`Dokploy 프로젝트를 찾을 수 없어: ${target.projectName}`);
+    if (!project) {
+      const created = await this.dk.post<{ project: { projectId: string; name: string }; environment: { environmentId: string; name: string } }>(
+        "project.create",
+        { name: target.projectName, description: "Created by deploy-bot" },
+      );
+      project = {
+        projectId: created.project.projectId,
+        name: created.project.name,
+        environments: [{ environmentId: created.environment.environmentId, name: created.environment.name, isDefault: true }],
+      };
+      await reporter.step(`프로젝트 만들었어: ${project.name}`);
+    }
+    let env = target.environmentId
+      ? project.environments.find((e) => e.environmentId === target.environmentId)
+      : project.environments.find((e) => e.name === target.environmentName);
+    if (target.environmentId && !env) throw new Error(`Dokploy 환경을 찾을 수 없어: ${target.environmentName}`);
+    if (!env) {
+      const created = await this.dk.post<{ environmentId: string; name: string }>("environment.create", {
+        name: target.environmentName,
+        projectId: project.projectId,
+        description: "Created by deploy-bot",
+      });
+      env = { environmentId: created.environmentId, name: created.name, isDefault: false };
+      await reporter.step(`환경 만들었어: ${env.name}`);
+    }
+    return { projectId: project.projectId, projectName: project.name, environmentId: env.environmentId, environmentName: env.name };
   }
 
   private url(host: string) {
@@ -165,22 +268,22 @@ export class Deployer {
     };
   }
 
-  async deploy(req: DeployRequest, progress: Progress): Promise<DeployResult> {
+  async deploy(req: DeployRequest, reporter: Reporter): Promise<DeployResult> {
     const { repo, plan } = req;
-    const environmentId = await this.environmentId();
+    const where = await this.resolveTarget(req.target, reporter);
     const githubId = await this.githubAppId(repo);
     if (!githubId && repo.private) {
       throw new Error("비공개 레포인데 Dokploy GitHub App이 이 레포에 접근 권한이 없어. Dokploy GitHub App 설치 범위에 레포를 추가해줘.");
     }
-    await progress(githubId ? "Dokploy GitHub App으로 소스 연결" : "공개 git URL로 소스 연결");
 
     const base = {
       name: repo.repo,
       appName: repo.repo.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").slice(0, 40),
       description: describeService(repo),
-      environmentId,
+      environmentId: where.environmentId,
       serverId: this.cfg.dokployServerId,
     };
+    const sourceLabel = githubId ? "GitHub App" : "공개 git URL";
 
     let service: ManagedService;
     if (plan.kind === "compose") {
@@ -188,12 +291,12 @@ export class Deployer {
         ...base,
         composeType: "docker-compose",
       });
-      service = { kind: "compose", id: compose.composeId, name: repo.repo, appName: compose.appName, repo: repoKey(repo), status: "idle" };
-      await progress(`Dokploy compose 생성: ${compose.appName}`);
+      service = { kind: "compose", id: compose.composeId, name: repo.repo, appName: compose.appName, repo: repoKey(repo), status: "idle", ...where };
       const source = githubId
         ? { sourceType: "github", githubId, owner: repo.owner, repository: repo.repo, branch: repo.defaultBranch }
         : { sourceType: "git", customGitUrl: repo.cloneUrl, customGitBranch: repo.defaultBranch };
       await this.dk.post("compose.update", { composeId: compose.composeId, ...source, composePath: plan.composePath });
+      await reporter.step(`Compose 서비스 만들고 소스 연결 (${sourceLabel})`);
       if (req.domain) {
         await this.dk.post("domain.create", {
           ...this.domainBody(req.domain, plan.port),
@@ -201,12 +304,11 @@ export class Deployer {
           serviceName: plan.serviceName,
           domainType: "compose",
         });
-        await progress(`도메인 연결: ${req.domain} -> ${plan.serviceName}:${plan.port}`);
+        await reporter.step(`도메인 연결: ${req.domain} → ${plan.serviceName}:${plan.port}`);
       }
     } else {
       const app = await this.dk.post<{ applicationId: string; appName: string }>("application.create", base);
-      service = { kind: "application", id: app.applicationId, name: repo.repo, appName: app.appName, repo: repoKey(repo), status: "idle" };
-      await progress(`Dokploy 앱 생성: ${app.appName}`);
+      service = { kind: "application", id: app.applicationId, name: repo.repo, appName: app.appName, repo: repoKey(repo), status: "idle", ...where };
       if (githubId) {
         await this.dk.post("application.saveGithubProvider", {
           applicationId: app.applicationId,
@@ -238,34 +340,34 @@ export class Deployer {
           createEnvFile: false,
         });
       }
-      await progress(`빌드 방식: ${plan.buildType === "railpack" ? `Railpack ${this.cfg.railpackVersion}` : `Dockerfile (${plan.dockerfile})`}`);
+      await reporter.step(`앱 만들고 소스 연결 (${sourceLabel}) · ${plan.buildType === "railpack" ? `Railpack ${this.cfg.railpackVersion}` : `Dockerfile ${plan.dockerfile}`}`);
       if (req.domain) {
         await this.dk.post("domain.create", {
           ...this.domainBody(req.domain, plan.port),
           applicationId: app.applicationId,
           domainType: "application",
         });
-        await progress(`도메인 연결: ${req.domain} -> :${plan.port}`);
+        await reporter.step(`도메인 연결: ${req.domain} → :${plan.port}`);
       }
     }
 
-    await progress("배포 시작");
-    let outcome = await this.runAndWait(service, "deploy", progress);
+    await reporter.step("빌드 시작");
+    let outcome = await this.runAndWait(service, "deploy", reporter);
     let usedAiDockerfile = false;
 
     if (outcome.status === "error" && plan.kind === "application" && plan.buildType === "railpack") {
       if (!this.cfg.ai) {
-        await progress("Railpack 빌드 실패. AI_API_KEY가 없어서 Dockerfile 자동 생성은 건너뜀");
+        await reporter.step("Railpack 빌드 실패. AI 키가 없어서 Dockerfile 자동 생성은 건너뜀");
       } else {
-        const result = await this.aiFallback(service, req, plan.port, outcome.logTail, progress);
+        const result = await this.aiFallback(service, req, plan.port, outcome.logTail, reporter);
         outcome = result.outcome;
         usedAiDockerfile = result.used;
       }
     }
 
     return {
+      ...outcome,
       service,
-      status: outcome.status,
       url: req.domain ? this.url(req.domain) : null,
       usedAiDockerfile,
       logTail: outcome.status === "done" ? null : outcome.logTail,
@@ -289,18 +391,18 @@ export class Deployer {
     req: DeployRequest,
     port: number,
     firstLog: string | null,
-    progress: Progress,
-  ): Promise<{ outcome: Awaited<ReturnType<Deployer["runAndWait"]>>; used: boolean }> {
+    reporter: Reporter,
+  ): Promise<{ outcome: RunOutcome; used: boolean }> {
     const ai = this.cfg.ai;
     if (!ai) throw new Error("AI is not configured");
     const readFile = (path: string) => this.gh.fileOrNull(req.repo, req.repo.defaultBranch, path);
     let log = firstLog;
     let previous: string | null = null;
     let patchId: string | null = null;
-    let outcome: Awaited<ReturnType<Deployer["runAndWait"]>> = { status: "error", logTail: firstLog };
+    let outcome: RunOutcome = { status: "error", logTail: firstLog, deploymentId: null };
 
     for (let attempt = 1; attempt <= ai.maxAttempts; attempt++) {
-      await progress(`Railpack 실패 -> AI로 Dockerfile 생성 중 (${attempt}/${ai.maxAttempts})`);
+      await reporter.step(`Railpack 실패 → AI가 Dockerfile 만드는 중 (${attempt}/${ai.maxAttempts})`);
       const generated = await generateDockerfile(
         ai,
         {
@@ -314,8 +416,8 @@ export class Deployer {
         this.aiFetch,
       );
       const { dockerfile } = generated;
-      for (const failure of generated.failures) await progress(`AI 제공자 실패, 다음으로 넘김 (${failure.split(":")[0]})`);
-      await progress(`${generated.provider} (${generated.model})가 Dockerfile 생성`);
+      for (const failure of generated.failures) await reporter.step(`AI 제공자 실패, 다음으로 넘김 (${failure.split(":")[0]})`);
+      await reporter.step(`${generated.provider} (${generated.model})가 Dockerfile 생성`);
       if (patchId) {
         await this.dk.post("patch.update", { patchId, content: dockerfile, type: "create", enabled: true });
       } else {
@@ -329,8 +431,8 @@ export class Deployer {
         patchId = patch.patchId;
         await this.saveBuildType(service.id, "dockerfile", AI_DOCKERFILE);
       }
-      await progress(`${AI_DOCKERFILE} 주입 후 Dockerfile 빌드로 재배포`);
-      outcome = await this.runAndWait(service, "deploy", progress);
+      await reporter.step(`${AI_DOCKERFILE} 넣고 다시 빌드`);
+      outcome = await this.runAndWait(service, "deploy", reporter);
       if (outcome.status !== "error") return { outcome, used: true };
       log = outcome.logTail;
       previous = dockerfile;
@@ -344,36 +446,31 @@ export class Deployer {
       : this.dk.get<DkDeployment[]>("deployment.allByCompose", { composeId: service.id });
   }
 
-  private async logTail(deploymentId: string): Promise<string | null> {
-    const text = await this.dk.get<string>("deployment.readLogs", { deploymentId, tail: 80 }).catch(() => null);
-    return typeof text === "string" && text.trim() ? text : null;
-  }
-
   /** "deploy" pulls the latest commit and builds; "redeploy" rebuilds the already-cloned code. */
-  async runAndWait(
-    service: ManagedService,
-    mode: "deploy" | "redeploy",
-    progress: Progress,
-  ): Promise<{ status: DeployResult["status"]; logTail: string | null }> {
+  async runAndWait(service: ManagedService, mode: "deploy" | "redeploy", reporter: Reporter): Promise<RunOutcome> {
     const before = new Set((await this.deployments(service)).map((d) => d.deploymentId));
     const idField = service.kind === "application" ? { applicationId: service.id } : { composeId: service.id };
     await this.dk.post(`${service.kind}.${mode}`, { ...idField, title: `deploy-bot ${mode}` });
 
     const deadline = this.now() + this.cfg.deployTimeoutMs;
-    let announced = false;
+    let current: DkDeployment | undefined;
     while (this.now() < deadline) {
       await this.sleep(this.cfg.pollIntervalMs);
-      const current = (await this.deployments(service)).find((d) => !before.has(d.deploymentId));
+      current = (await this.deployments(service)).find((d) => !before.has(d.deploymentId));
       if (!current) continue;
-      if (!announced) {
-        announced = true;
-        await progress("빌드 진행 중...");
-      }
       if (TERMINAL.has(current.status)) {
         const status = current.status as "done" | "error" | "cancelled";
-        return { status, logTail: status === "done" ? null : await this.logTail(current.deploymentId) };
+        return {
+          status,
+          logTail: status === "done" ? null : await this.buildLog(current.deploymentId),
+          deploymentId: current.deploymentId,
+        };
+      }
+      if (reporter.log) {
+        const tail = await this.buildLog(current.deploymentId, LIVE_LOG_LINES);
+        if (tail) await reporter.log(tail);
       }
     }
-    return { status: "timeout", logTail: null };
+    return { status: "timeout", logTail: null, deploymentId: current?.deploymentId ?? null };
   }
 }
