@@ -1,4 +1,4 @@
-import type { AiConfig } from "./config.ts";
+import type { AiConfig, AiProvider } from "./config.ts";
 import type { FetchLike } from "./dokploy.ts";
 
 const MANIFESTS = [
@@ -64,26 +64,50 @@ const SYSTEM = `You write production Dockerfiles for arbitrary GitHub repositori
 Rules: use official, specific base image tags; multi-stage builds when there is a build step; install dependencies from the lockfile that exists; never reference files that are not in the file list; run a long-lived HTTP server in the foreground; serve static sites with a small web server on the required port.
 Reply with exactly one \`\`\`dockerfile code block and nothing else.`;
 
+export interface GeneratedDockerfile {
+  dockerfile: string;
+  provider: string;
+  model: string;
+  failures: string[];
+}
+
+async function askProvider(provider: AiProvider, prompt: string, timeoutMs: number, fetchImpl: FetchLike): Promise<string> {
+  const res = await fetchImpl(`${provider.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: provider.model,
+      messages: [
+        { role: "system", content: SYSTEM },
+        { role: "user", content: prompt },
+      ],
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const body = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+  const reply = body.choices?.[0]?.message?.content ?? "";
+  const dockerfile = extractDockerfile(reply);
+  if (!dockerfile) throw new Error(`no Dockerfile in reply: ${reply.slice(0, 120)}`);
+  return dockerfile;
+}
+
 export async function generateDockerfile(
   ai: AiConfig,
   req: DockerfileRequest,
   fetchImpl: FetchLike = fetch,
-): Promise<string> {
-  const res = await fetchImpl(`${ai.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${ai.apiKey}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      model: ai.model,
-      messages: [
-        { role: "system", content: SYSTEM },
-        { role: "user", content: await buildPrompt(req) },
-      ],
-    }),
-  });
-  if (!res.ok) throw new Error(`AI API ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const body = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-  const reply = body.choices?.[0]?.message?.content ?? "";
-  const dockerfile = extractDockerfile(reply);
-  if (!dockerfile) throw new Error(`AI 응답에서 Dockerfile을 찾지 못했어: ${reply.slice(0, 200)}`);
-  return dockerfile;
+): Promise<GeneratedDockerfile> {
+  const prompt = await buildPrompt(req);
+  const failures: string[] = [];
+  for (const provider of ai.providers) {
+    try {
+      const dockerfile = await askProvider(provider, prompt, ai.timeoutMs, fetchImpl);
+      return { dockerfile, provider: provider.name, model: provider.model, failures };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      failures.push(`${provider.name}: ${reason}`);
+      console.warn(`[deploy-bot] AI provider ${provider.name} (${provider.model}) failed: ${reason}`);
+    }
+  }
+  throw new Error(`모든 AI 제공자가 실패했어\n${failures.join("\n")}`);
 }

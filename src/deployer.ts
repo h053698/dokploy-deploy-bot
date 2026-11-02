@@ -301,7 +301,7 @@ export class Deployer {
 
     for (let attempt = 1; attempt <= ai.maxAttempts; attempt++) {
       await progress(`Railpack 실패 -> AI로 Dockerfile 생성 중 (${attempt}/${ai.maxAttempts})`);
-      const dockerfile = await generateDockerfile(
+      const generated = await generateDockerfile(
         ai,
         {
           repo: repoKey(req.repo),
@@ -313,6 +313,9 @@ export class Deployer {
         },
         this.aiFetch,
       );
+      const { dockerfile } = generated;
+      for (const failure of generated.failures) await progress(`AI 제공자 실패, 다음으로 넘김 (${failure.split(":")[0]})`);
+      await progress(`${generated.provider} (${generated.model})가 Dockerfile 생성`);
       if (patchId) {
         await this.dk.post("patch.update", { patchId, content: dockerfile, type: "create", enabled: true });
       } else {

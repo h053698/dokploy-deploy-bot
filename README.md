@@ -50,6 +50,6 @@ Deploying on Dokploy: this repo has a `Dockerfile`, so you can register it as a 
 ## Notes
 
 - Private repos: if the Dokploy GitHub App has access, the bot connects through it. Otherwise it clones the public URL. To analyze a private repo you also need `GITHUB_TOKEN`.
-- AI: any OpenAI-compatible `/chat/completions` endpoint (OpenAI, OpenRouter, Ollama, etc.). With `AI_API_KEY` empty, the AI fallback is off.
+- AI: set any of `GEMINI_API_KEY`, `MISTRAL_API_KEY`, `OPENROUTER_API_KEY`, or a custom OpenAI-compatible `AI_BASE_URL`/`AI_API_KEY`/`AI_MODEL`. Every provider with a key joins a fallback chain (custom > Gemini > Mistral > OpenRouter, or `AI_PROVIDER_ORDER`). If one fails, is rate-limited, or replies without a Dockerfile, the next one is tried, and the progress message names the provider that answered. With no keys, the AI fallback is off.
 - You can edit or delete the generated Dockerfile in the Dokploy service under Patches.
 - For a Dockerfile/Railpack app with no `EXPOSE`, the bot sets the `PORT` env var to the port it assumed (Railpack: Node 3000, Python 8000, Go/Ruby 8080).
