@@ -108,8 +108,9 @@ export class Deployer {
   }
 
   async listManaged(): Promise<ManagedService[]> {
-    const project = await this.findProject();
-    if (!project) return [];
+    const summary = await this.findProject();
+    if (!summary) return [];
+    const project = await this.dk.get<DkProject>("project.one", { projectId: summary.projectId });
     const services: ManagedService[] = [];
     for (const env of project.environments) {
       for (const a of env.applications) {

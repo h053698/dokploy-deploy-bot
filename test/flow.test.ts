@@ -59,6 +59,22 @@ class FakeDokploy {
               name: "production",
               isDefault: true,
               compose: [],
+              applications: this.apps.map((a) => ({ applicationId: a.applicationId, name: a.name, applicationStatus: "done" })),
+            },
+          ],
+        }));
+      case "project.one": {
+        const p = this.projects.find((x) => x.projectId === body.projectId);
+        if (!p) throw new Error(`unknown project ${String(body.projectId)}`);
+        return {
+          projectId: p.projectId,
+          name: p.name,
+          environments: [
+            {
+              environmentId: p.environmentId,
+              name: "production",
+              isDefault: true,
+              compose: [],
               applications: this.apps.map((a) => ({
                 applicationId: a.applicationId,
                 name: a.name,
@@ -68,7 +84,8 @@ class FakeDokploy {
               })),
             },
           ],
-        }));
+        };
+      }
       case "project.create": {
         const project = { projectId: `p${++this.id}`, name: String(body.name), environmentId: `e${++this.id}` };
         this.projects.push(project);
@@ -237,7 +254,7 @@ describe("telegram flow", () => {
     expect(summary).toContain("https://hello.arpa.page");
     expect(summary).toContain("DNS가 아직 안 잡혀");
 
-    const mutations = dk.paths().filter((p) => !["project.all", "deployment.all", "github.githubProviders", "deployment.readLogs"].includes(p));
+    const mutations = dk.paths().filter((p) => !["project.all", "project.one", "deployment.all", "github.githubProviders", "deployment.readLogs"].includes(p));
     expect(mutations).toEqual([
       "project.create",
       "application.create",
