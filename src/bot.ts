@@ -94,12 +94,23 @@ function richButton(b: RichButton): string {
 
 const richRows = (rows: RichButton[][]) => rows.filter((r) => r.length).map((r) => `<tg-button-row>${r.map(richButton).join("")}</tg-button-row>`).join("");
 
-const richParagraphs = (html: string) =>
-  html
+function toRich(html: string): string {
+  const quotes: string[] = [];
+  const masked = html
+    .replace(/<blockquote expandable>([\s\S]*?)<\/blockquote>/g, (_m, inner: string) => {
+      quotes.push(`<blockquote expandable>${inner.replace(/\n/g, "<br>")}</blockquote>`);
+      return `\n\n@@Q${quotes.length - 1}@@\n\n`;
+    })
     .split("\n\n")
-    .filter((p) => p.trim())
-    .map((p) => `<p>${p.trim().replace(/\n/g, "<br>")}</p>`)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  return masked
+    .map((p) => {
+      const quote = /^@@Q(\d+)@@$/.exec(p);
+      return quote ? (quotes[Number(quote[1])] ?? "") : `<p>${p.replace(/\n/g, "<br>")}</p>`;
+    })
     .join("");
+}
 
 function toInline(rows: RichButton[][]): InlineKeyboard {
   const kb = new InlineKeyboard();
@@ -117,6 +128,56 @@ function toInline(rows: RichButton[][]): InlineKeyboard {
     kb.row();
   }
   return kb;
+}
+
+type Api = Context["api"];
+
+interface DeliverOptions {
+  ephemeralTo?: number;
+  forceReply?: { selective: boolean; placeholder?: string };
+  effect?: string | null;
+}
+
+const isEphemeralDenied = (error: unknown) => /BOT_NOT_ADMIN|ephemeral/i.test(String(error));
+
+async function deliver(
+  api: Api,
+  place: Place,
+  content: string | { classic: string; rich: string },
+  rows: RichButton[][] = [],
+  opts: DeliverOptions = {},
+): Promise<number> {
+  const { classic, rich } = typeof content === "string" ? { classic: content, rich: toRich(content) } : content;
+  const extra = {
+    ...threadOf(place),
+    ...(opts.ephemeralTo === undefined ? {} : { ephemeral_message_parameters: { receiver_user_id: opts.ephemeralTo } }),
+    ...(opts.effect ? { message_effect_id: opts.effect } : {}),
+  };
+  const fr = opts.forceReply;
+  const markup = fr ? { force_reply: true as const, ...(fr.selective ? { selective: true } : {}), ...(fr.placeholder ? { input_field_placeholder: fr.placeholder.slice(0, 64) } : {}) } : undefined;
+  try {
+    const sent = await api.sendRichMessage(place.chatId, { html: rich + richRows(rows) }, { ...extra, ...(markup ? { reply_markup: markup } : {}) });
+    return (sent as { message_id?: number }).message_id ?? 0;
+  } catch (error) {
+    if (opts.ephemeralTo !== undefined && isEphemeralDenied(error)) throw error;
+    console.warn("[deploy-bot] rich message failed, falling back to HTML:", error instanceof Error ? error.message : error);
+    const inline = toInline(rows);
+    const reply_markup = fr ? Object.assign(inline.forceReply(), fr.selective ? { selective: true } : {}) : rows.length ? inline : undefined;
+    const sent = await api.sendMessage(place.chatId, classic.slice(0, MAX_MESSAGE), { ...HTML, ...extra, ...(reply_markup ? { reply_markup } : {}) });
+    return sent.message_id;
+  }
+}
+
+async function redraw(api: Api, place: Place, messageId: number, content: string | { classic: string; rich: string }, rows: RichButton[][] = []): Promise<void> {
+  const { classic, rich } = typeof content === "string" ? { classic: content, rich: toRich(content) } : content;
+  try {
+    await api.editMessageText(place.chatId, messageId, { html: rich + richRows(rows) });
+  } catch (error) {
+    if (String(error).includes("message is not modified")) return;
+    await api.editMessageText(place.chatId, messageId, classic.slice(0, MAX_MESSAGE), { ...HTML, reply_markup: toInline(rows) }).catch((e: unknown) => {
+      if (!String(e).includes("message is not modified")) throw e;
+    });
+  }
 }
 
 const richLog = (log: string) => `<blockquote expandable>${esc(clipTail(cleanLog(log) || log.trim(), RICH_LOG_CHARS)).replace(/\n/g, "<br>")}</blockquote>`;
@@ -268,7 +329,7 @@ class LiveStatus implements Reporter {
   private readonly startedAt: number;
 
   constructor(
-    private readonly api: Context["api"],
+    private readonly api: Api,
     private readonly place: Place,
     private readonly header: string,
     private readonly now: () => number = Date.now,
@@ -292,12 +353,8 @@ class LiveStatus implements Reporter {
     this.lastText = body;
     this.lastEdit = this.now();
     this.chain = this.chain.then(async () => {
-      if (this.messageId === null) {
-        const msg = await this.api.sendMessage(this.place.chatId, text, { ...HTML, ...threadOf(this.place) });
-        this.messageId = msg.message_id;
-      } else {
-        await this.api.editMessageText(this.place.chatId, this.messageId, text, HTML).catch(() => undefined);
-      }
+      if (this.messageId === null) this.messageId = await deliver(this.api, this.place, text);
+      else await redraw(this.api, this.place, this.messageId, text).catch(() => undefined);
     });
     return this.chain.then(() => undefined);
   }
@@ -326,38 +383,31 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
   const jobs = new Set<Promise<void>>();
   let seq = 0;
 
-  const notice = async (ctx: Context, text: string) => {
+  const notice = async (ctx: Context, html: string, rows: RichButton[][] = []) => {
     const chat = ctx.chat;
     const userId = ctx.from?.id;
+    const place = whereOf(ctx);
     if (chat && chat.type !== "private" && userId !== undefined && (noEphemeral.get(chat.id) ?? 0) < Date.now()) {
       try {
-        return await ctx.reply(text, { ...HTML, ephemeral_message_parameters: { receiver_user_id: userId } });
+        return await deliver(ctx.api, place, html, rows, { ephemeralTo: userId });
       } catch (error) {
-        if (!/BOT_NOT_ADMIN|ephemeral/i.test(String(error))) throw error;
+        if (!isEphemeralDenied(error)) throw error;
         noEphemeral.set(chat.id, Date.now() + NO_EPHEMERAL_MS);
       }
     }
-    return ctx.reply(text, HTML);
+    return deliver(ctx.api, place, html, rows);
   };
 
-  const sendRich = async (api: Context["api"], place: Place, html: string, fallback: string, rows: RichButton[][], effect: string | null = null) => {
-    try {
-      await api.sendRichMessage(place.chatId, { html: html + richRows(rows) }, { ...threadOf(place), ...(effect ? { message_effect_id: effect } : {}) });
-    } catch (error) {
-      console.warn("[deploy-bot] rich message failed, falling back to HTML:", error instanceof Error ? error.message : error);
-      await api.sendMessage(place.chatId, fallback.slice(0, MAX_MESSAGE), { ...HTML, ...threadOf(place), reply_markup: toInline(rows) });
-    }
-  };
+  const say = (ctx: Context, html: string, rows: RichButton[][] = []) => deliver(ctx.api, whereOf(ctx), html, rows);
 
   const notifyAdmins = async (ctx: Context, userId: number) => {
     if (notifiedRequests.has(userId)) return;
     notifiedRequests.add(userId);
     const u = ctx.from;
     const who = [u?.first_name, u?.last_name].filter(Boolean).join(" ") + (u?.username ? ` (@${u.username})` : "");
-    const keyboard = new InlineKeyboard().text("허용", `acl:add:${userId}`).success().text("무시", `acl:ignore:${userId}`);
+    const rows: RichButton[][] = [[{ label: "허용", data: `acl:add:${userId}`, style: "success" }, { label: "무시", data: `acl:ignore:${userId}` }]];
     for (const admin of access.list().admins) {
-      await ctx.api
-        .sendMessage(admin, `접근 요청: ${esc(who || "이름 없음")} · ID ${code(String(userId))}`, { ...HTML, reply_markup: keyboard })
+      await deliver(ctx.api, { chatId: admin }, `접근 요청: ${esc(who || "이름 없음")} · ID ${code(String(userId))}`, rows)
         .catch((error: unknown) => console.warn(`[deploy-bot] could not notify admin ${admin}:`, error instanceof Error ? error.message : error));
     }
   };
@@ -372,7 +422,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
       .catch(async (error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         console.error("[deploy-bot]", error);
-        await ctx.reply(`오류: ${esc(message).slice(0, MAX_MESSAGE)}`, HTML).catch(() => undefined);
+        await say(ctx, `오류: ${esc(message).slice(0, MAX_MESSAGE)}`).catch(() => undefined);
       })
       .finally(() => jobs.delete(job));
     jobs.add(job);
@@ -391,10 +441,10 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     if (ctx.callbackQuery) {
       await ctx.answerCallbackQuery({ text: "권한 없음" });
     } else if (isCommand && ctx.chat?.type === "private") {
-      await ctx.reply(`권한이 없어. 관리자에게 접근 요청을 보냈어. 내 ID: ${id ?? "unknown"}`);
+      await say(ctx, `권한이 없어. 관리자에게 접근 요청을 보냈어. 내 ID: ${id ?? "unknown"}`);
       if (id !== undefined) await notifyAdmins(ctx, id);
     } else if (isCommand && ctx.chat) {
-      await ctx.reply(`이 그룹에서는 쓸 수 없어. 그룹 ID: ${ctx.chat.id}`);
+      await say(ctx, `이 그룹에서는 쓸 수 없어. 그룹 ID: ${ctx.chat.id}`);
     }
   });
 
@@ -470,15 +520,18 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     }
     const [, action, raw = ""] = ctx.match;
     const target = Number(raw);
-    await ctx.editMessageReplyMarkup().catch(() => undefined);
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const settle = (text: string) => (messageId === undefined ? Promise.resolve() : redraw(ctx.api, whereOf(ctx), messageId, text).catch(() => undefined));
     if (action === "ignore") {
+      await settle(`접근 요청 ID ${code(raw)}: 무시함`);
       await ctx.answerCallbackQuery({ text: "무시했어" });
       return;
     }
     const result = await access.add(target);
+    await settle(`접근 요청 ID ${code(raw)}: 허용함`);
     console.log(`[deploy-bot] allow user=${target} by=${ctx.from.id} result=${result} via=request`);
     await ctx.answerCallbackQuery({ text: result === "added" ? "허용했어" : "이미 허용돼 있어" });
-    await ctx.api.sendMessage(target, "관리자가 허용했어. /help 로 사용법 확인해").catch(() => undefined);
+    await deliver(ctx.api, { chatId: target }, "관리자가 허용했어. /help 로 사용법 확인해").catch(() => undefined);
   });
 
   const statusWord = (s: string) => ({ done: "정상", running: "배포 중", error: "실패", idle: "대기" })[s] ?? s;
@@ -491,7 +544,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
       .map((s) => `<tr><td>${esc(s.repo)}</td><td>${esc(`${s.projectName} / ${s.environmentName}`)}</td><td>${s.kind === "compose" ? "compose" : "app"}</td><td>${statusWord(s.status)}</td></tr>`)
       .join("");
     const html = `<h3>관리 중인 서비스 (${services.length})</h3><table bordered striped compact><tr><th>레포</th><th>프로젝트 / 환경</th><th>종류</th><th>상태</th></tr>${rows}</table>`;
-    await sendRich(ctx.api, whereOf(ctx), html, fallback, []);
+    await deliver(ctx.api, whereOf(ctx), { classic: fallback, rich: html }, []);
   });
 
   const wizardRows = (token: string, w: Wizard): RichButton[][] => {
@@ -538,7 +591,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
   const render = async (ctx: Context, token: string, w: Wizard, frozen: string | null = null) => {
     const rows: RichButton[][] = frozen ? [[{ label: frozen, disabled: true }]] : wizardRows(token, w);
     try {
-      await ctx.api.editMessageText(w.place.chatId, w.messageId, { html: richParagraphs(wizardText(w, cfg)) + richRows(rows) });
+      await ctx.api.editMessageText(w.place.chatId, w.messageId, { html: toRich(wizardText(w, cfg)) + richRows(rows) });
     } catch (error) {
       if (String(error).includes("message is not modified")) return;
       console.warn("[deploy-bot] rich wizard failed, falling back to HTML:", error instanceof Error ? error.message : error);
@@ -557,7 +610,8 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     if (userId === undefined) return;
     await react(ctx, "👀");
 
-    const status = await ctx.reply(`${bold(`${ref.owner}/${ref.repo}`)} 분석 중...`, HTML);
+    const place = whereOf(ctx);
+    const statusId = await say(ctx, `${bold(`${ref.owner}/${ref.repo}`)} 분석 중...`);
     await ctx.replyWithChatAction("typing").catch(() => undefined);
     try {
       const [repo, projects, existing] = await Promise.all([gh.repo(ref), deployer.listProjects(), deployer.findByRepo(ref)]);
@@ -568,8 +622,8 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
       const token = (++seq).toString(36);
       const w: Wizard = {
         userId,
-        place: whereOf(ctx),
-        messageId: status.message_id,
+        place,
+        messageId: statusId,
         promptId: null,
         repo,
         files,
@@ -587,17 +641,15 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
       wizards.set(token, w);
       await render(ctx, token, w);
       if (existing.length > 0) {
-        const kb = new InlineKeyboard();
-        for (const s of existing.slice(0, 5)) {
-          const k = s.kind === "application" ? "a" : "c";
-          if (busy.has(s.repo)) kb.disabled(`${s.projectName}/${s.environmentName} 진행 중`).row();
-          else kb.text(`${s.projectName}/${s.environmentName} 업데이트`, `run:u:${k}:${s.id}`).row();
-        }
-        await ctx.reply(`이 레포는 이미 ${existing.length}곳에 배포돼 있어. 새로 만드는 대신 업데이트할 수도 있어.`, { reply_markup: kb });
+        const shortcuts = existing.slice(0, 5).map((s): RichButton[] => {
+          const label = `${s.projectName}/${s.environmentName}`;
+          return busy.has(s.repo) ? [{ label: `${label} 진행 중`, disabled: true }] : [{ label: `${label} 업데이트`, data: `run:u:${s.kind === "application" ? "a" : "c"}:${s.id}` }];
+        });
+        await say(ctx, `이 레포는 이미 ${existing.length}곳에 배포돼 있어. 새로 만드는 대신 업데이트할 수도 있어.`, shortcuts);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await ctx.api.editMessageText(status.chat.id, status.message_id, `${esc(message)}`, HTML).catch(() => undefined);
+      await redraw(ctx.api, place, statusId, esc(message)).catch(() => undefined);
     }
   });
 
@@ -631,11 +683,8 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
   const askText = async (ctx: Context, token: string, w: Wizard, hint: string) => {
     const mention = `<a href="tg://user?id=${w.userId}">${esc(ctx.from?.first_name ?? "너")}</a>`;
     const isPrivate = ctx.chat?.type === "private";
-    const reply_markup = isPrivate
-      ? new InlineKeyboard().text("취소", `wz:${token}:back:${w.step}`).forceReply()
-      : { force_reply: true as const, selective: true, input_field_placeholder: hint.slice(0, 64) };
-    const prompt = await ctx.api.sendMessage(w.place.chatId, `${isPrivate ? "" : `${mention} `}${esc(hint)}`, { ...HTML, ...threadOf(w.place), reply_markup });
-    w.promptId = prompt.message_id;
+    const rows: RichButton[][] = [[{ label: "취소", data: `wz:${token}:back:${w.step}` }]];
+    w.promptId = await deliver(ctx.api, w.place, `${isPrivate ? "" : `${mention} `}${esc(hint)}`, rows, { forceReply: { selective: !isPrivate, placeholder: hint } });
   };
 
   bot.callbackQuery(/^wz:([a-z0-9]+):([a-z]+)(?::(.+))?$/, async (ctx) => {
@@ -709,18 +758,18 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     const text = ctx.message.text;
     if (w.awaiting === "project") {
       const name = normalizeName(text);
-      if (!name) return ctx.reply("이름은 영문 소문자, 숫자, - . _ 만 돼 (최대 63자). 다시 보내줘");
+      if (!name) return say(ctx, "이름은 영문 소문자, 숫자, - . _ 만 돼 (최대 63자). 다시 보내줘");
       const existing = w.projects.find((p) => p.name === name);
       chooseProject(w, existing ? { projectId: existing.projectId, projectName: existing.name } : { projectId: null, projectName: name });
     } else if (w.awaiting === "env" && w.target) {
       const name = normalizeName(text);
-      if (!name) return ctx.reply("환경 이름은 영문 소문자, 숫자, - . _ 만 돼. 다시 보내줘");
+      if (!name) return say(ctx, "환경 이름은 영문 소문자, 숫자, - . _ 만 돼. 다시 보내줘");
       const env = w.projects.find((p) => p.projectId === w.target?.projectId)?.environments.find((e) => e.name === name);
       w.target = { ...w.target, environmentId: env?.environmentId ?? null, environmentName: name };
       w.step = "domain";
     } else if (w.awaiting === "domain") {
       const domain = normalizeDomain(text, cfg.baseDomain);
-      if (!domain) return ctx.reply(`도메인 형식이 이상해. 다시 보내줘 (예: myapp.${cfg.baseDomain})`);
+      if (!domain) return say(ctx, `도메인 형식이 이상해. 다시 보내줘 (예: myapp.${cfg.baseDomain})`);
       await chooseDomain(w, domain);
     }
     w.awaiting = null;
@@ -733,7 +782,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     const full: FullResult = { ...result, dashboard: deployer.dashboardUrl(result.service) };
     await live.remove();
     const effect = result.status === "done" && ctx.chat?.type === "private" ? SUCCESS_EFFECT_ID : null;
-    await sendRich(ctx.api, place, resultRich(full), resultText(full, cfg), resultButtons(full), effect);
+    await deliver(ctx.api, place, { classic: resultText(full, cfg), rich: resultRich(full) }, resultButtons(full), { effect });
   };
 
   const startDeploy = async (ctx: Context, token: string, w: Wizard) => {
@@ -805,15 +854,13 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     const chosen = exact.length === 1 ? exact : matches;
     if (chosen.length === 1 && q) return chosen[0] ?? null;
     const list = chosen.length > 0 ? chosen : services;
-    const kb = new InlineKeyboard();
-    for (const s of list.slice(0, MAX_PICKER_ITEMS)) {
+    const rows = list.slice(0, MAX_PICKER_ITEMS).map((s): RichButton[] => {
       const label = `${s.repo} · ${s.environmentName}`;
-      if (prefix !== "log:r" && busy.has(s.repo)) kb.disabled(`${label} (진행 중)`);
-      else kb.text(label, `${prefix}:${s.kind === "application" ? "a" : "c"}:${s.id}`);
-      kb.row();
-    }
+      if (prefix !== "log:r" && busy.has(s.repo)) return [{ label: `${label} (진행 중)`, disabled: true }];
+      return [{ label, data: `${prefix}:${s.kind === "application" ? "a" : "c"}:${s.id}` }];
+    });
     const head = q && chosen.length === 0 ? `"${esc(query.trim())}"랑 맞는 게 없어. 전체에서 골라줘` : `어떤 서비스를 ${verb}?`;
-    await ctx.reply(head, { ...HTML, reply_markup: kb });
+    await say(ctx, head, rows);
     return null;
   };
 
@@ -824,10 +871,9 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     await ctx.replyWithChatAction("typing").catch(() => undefined);
     const log = await deployer.runtimeLog(service).catch((e: unknown) => `로그를 못 가져왔어: ${e instanceof Error ? e.message : String(e)}`);
     const k = service.kind === "application" ? "a" : "c";
-    await ctx.reply(
-      [`${bold(service.repo)} 실행 로그 <i>(최근)</i>`, log ? logBlock(log) : "<i>로그가 아직 없어</i>"].join("\n"),
-      { ...HTML, reply_markup: new InlineKeyboard().text("새로고침", `log:r:${k}:${service.id}`).url("Dokploy", deployer.dashboardUrl(service)) },
-    );
+    await say(ctx, [`${bold(service.repo)} 실행 로그 <i>(최근)</i>`, log ? logBlock(log) : "<i>로그가 아직 없어</i>"].join("\n"), [
+      [{ label: "새로고침", data: `log:r:${k}:${service.id}` }, { label: "Dokploy", url: deployer.dashboardUrl(service) }],
+    ]);
   };
 
   bot.command("update", async (ctx) => {
@@ -865,13 +911,13 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     if (!service) return ctx.answerCallbackQuery({ text: "서비스를 찾을 수 없어" });
     await ctx.answerCallbackQuery();
     const log = await deployer.buildLog(deploymentId, 300);
-    await ctx.reply([`${bold(service.repo)} 빌드 로그`, log ? logBlock(log) : "<i>로그가 없어</i>"].join("\n"), HTML);
+    await say(ctx, [`${bold(service.repo)} 빌드 로그`, log ? logBlock(log) : "<i>로그가 없어</i>"].join("\n"));
   });
 
   bot.catch(async (err) => {
     console.error("[deploy-bot]", err.error);
     const message = err.error instanceof Error ? err.error.message : String(err.error);
-    await err.ctx.reply(`오류: ${esc(message).slice(0, MAX_MESSAGE)}`, HTML).catch(() => undefined);
+    await say(err.ctx, `오류: ${esc(message).slice(0, MAX_MESSAGE)}`).catch(() => undefined);
   });
 
   return { bot, idle: async () => void (await Promise.all([...jobs])) };

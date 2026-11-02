@@ -290,6 +290,9 @@ const buttons = (s: Sent | undefined): Btn[] => {
 };
 const lastWith = (sent: Sent[], pred: (s: Sent) => boolean) => [...sent].reverse().find(pred);
 const bodyOf = (s: Sent | undefined) => String(s?.payload.text ?? (s?.payload.rich_message as { html?: string } | undefined)?.html ?? "");
+const isOutbound = (s: Sent) => s.method === "sendMessage" || s.method === "sendRichMessage";
+const outbound = (sent: Sent[], pred: (s: Sent) => boolean = () => true) => lastWith(sent, (s) => isOutbound(s) && pred(s));
+const forceReply = (s: Sent) => Boolean((s.payload.reply_markup as { force_reply?: boolean } | undefined)?.force_reply);
 const resultCard = (sent: Sent[], needle: string) => lastWith(sent, (s) => s.method === "sendRichMessage" && bodyOf(s).includes(needle));
 const wizard = (sent: Sent[]) => lastWith(sent, (s) => s.method === "editMessageText" && buttons(s).some((b) => b.callback_data?.startsWith("wz:")));
 const press = (s: Sent | undefined, label: string | RegExp, userId = OWNER_ID, inChat: AnyChat = chat, topic = false) => {
@@ -458,10 +461,11 @@ describe("telegram flow", () => {
     await bot.handleUpdate(command("/deploy h053698/hello"));
     await bot.handleUpdate(railpack(sent));
     await bot.handleUpdate(press(wizard(sent), "이름 직접 입력"));
-    const prompt = lastWith(sent, (s) => s.method === "sendMessage" && Boolean((s.payload.reply_markup as { force_reply?: boolean } | undefined)?.force_reply));
-    expect(prompt?.payload.reply_markup).toMatchObject({ force_reply: true, inline_keyboard: [[{ text: "취소" }]] });
+    const prompt = outbound(sent, forceReply);
+    expect(prompt?.payload.reply_markup).toMatchObject({ force_reply: true });
+    expect(buttons(prompt).map((b) => b.text)).toEqual(["취소"]);
     await bot.handleUpdate(reply("Bad Name!!"));
-    expect(String(lastWith(sent, (s) => s.method === "sendMessage")?.payload.text)).toContain("영문 소문자");
+    expect(bodyOf(outbound(sent))).toContain("영문 소문자");
     await bot.handleUpdate(reply("Team-Apps"));
     expect(sent.some((s) => s.method === "deleteMessage")).toBe(true);
     await bot.handleUpdate(press(wizard(sent), "직접 입력"));
@@ -482,9 +486,9 @@ describe("telegram flow", () => {
     await bot.handleUpdate(command("/deploy h053698/hello", STRANGER_ID, group(GROUP_ID)));
     await bot.handleUpdate(press(wizard(sent), /Railpack/, STRANGER_ID, group(GROUP_ID)));
     await bot.handleUpdate(press(wizard(sent), "이름 직접 입력", STRANGER_ID, group(GROUP_ID)));
-    const prompt = lastWith(sent, (s) => s.method === "sendMessage" && Boolean((s.payload.reply_markup as { force_reply?: boolean } | undefined)?.force_reply));
+    const prompt = outbound(sent, forceReply);
     expect(prompt?.payload.reply_markup).toMatchObject({ force_reply: true, selective: true });
-    expect(String(prompt?.payload.text)).toContain(`tg://user?id=${STRANGER_ID}`);
+    expect(bodyOf(prompt)).toContain(`tg://user?id=${STRANGER_ID}`);
   });
 
   test("another user cannot drive someone else's wizard; cancel ends it", async () => {
@@ -508,8 +512,8 @@ describe("telegram flow", () => {
     dk.addApp("hello-api", p.envs[1]?.environmentId ?? "");
 
     await bot.handleUpdate(command("/update hel"));
-    const picker = lastWith(sent, (s) => buttons(s).length > 0);
-    expect(picker?.payload.text).toBe("어떤 서비스를 업데이트할까?");
+    const picker = outbound(sent, (s) => buttons(s).length > 0);
+    expect(bodyOf(picker)).toContain("어떤 서비스를 업데이트할까?");
     expect(buttons(picker).map((b) => b.text)).toEqual(["h053698/hello · production", "h053698/hello-api · staging"]);
 
     await bot.handleUpdate(click(buttons(picker)[1]?.callback_data ?? ""));
@@ -544,7 +548,7 @@ describe("telegram flow", () => {
     expect(final?.payload.message_effect_id).toBeUndefined();
     const logBtn = buttons(final).find((b) => b.text === "빌드 로그");
     await bot.handleUpdate(click(logBtn?.callback_data ?? ""));
-    expect(String(lastWith(sent, (s) => s.method === "sendMessage")?.payload.text)).toContain("빌드 로그");
+    expect(bodyOf(outbound(sent))).toContain("빌드 로그");
   });
 
   test("/logs shows runtime logs with refresh", async () => {
@@ -552,9 +556,9 @@ describe("telegram flow", () => {
     const p = dk.addProject("team");
     dk.addApp("hello", p.envs[0]?.environmentId ?? "");
     await bot.handleUpdate(command("/logs hello"));
-    const msg = lastWith(sent, (s) => s.method === "sendMessage");
-    expect(String(msg?.payload.text)).toContain("listening on :3000");
-    expect(String(msg?.payload.text)).not.toContain("sha256:");
+    const msg = outbound(sent);
+    expect(bodyOf(msg)).toContain("listening on :3000");
+    expect(bodyOf(msg)).not.toContain("sha256:");
     expect(buttons(msg).map((b) => b.text)).toEqual(["새로고침", "Dokploy"]);
   });
 
@@ -564,7 +568,7 @@ describe("telegram flow", () => {
     dk.addApp("hello", p.envs[0]?.environmentId ?? "");
     await bot.handleUpdate(command("/deploy https://github.com/h053698/hello"));
     expect(wizard(sent)).toBeDefined();
-    const shortcut = lastWith(sent, (s) => String(s.payload.text).includes("이미 1곳에 배포돼"));
+    const shortcut = outbound(sent, (s) => bodyOf(s).includes("이미 1곳에 배포돼"));
     expect(buttons(shortcut).map((b) => b.callback_data)).toEqual([`run:u:a:id-hello-${p.envs[0]?.environmentId}`]);
     expect(dk.paths()).not.toContain("application.create");
   });
@@ -609,7 +613,7 @@ describe("telegram flow", () => {
   test("other groups are rejected even for allowed users, and the reply shows the group id", async () => {
     const { bot, dk, sent } = await setup();
     await bot.handleUpdate(command("/deploy https://github.com/h053698/hello", OWNER_ID, group(OTHER_GROUP_ID)));
-    expect(String(sent[0]?.payload.text)).toContain(String(OTHER_GROUP_ID));
+    expect(bodyOf(sent[0])).toContain(String(OTHER_GROUP_ID));
     expect(dk.calls).toEqual([]);
   });
 
@@ -623,7 +627,7 @@ describe("telegram flow", () => {
     const { bot, dk, sent } = await setup();
     await bot.handleUpdate(command("/deploy https://github.com/h053698/hello", STRANGER_ID));
     await bot.handleUpdate(click("run:u:a:id-hello", STRANGER_ID));
-    expect(String(sent[0]?.payload.text)).toContain(String(STRANGER_ID));
+    expect(bodyOf(sent[0])).toContain(String(STRANGER_ID));
     expect(sent.find((s) => s.method === "answerCallbackQuery")?.payload).toMatchObject({ text: "권한 없음" });
     expect(dk.calls).toEqual([]);
   });
@@ -634,7 +638,7 @@ describe("telegram flow", () => {
     expect(dk.calls).toEqual([]);
 
     await bot.handleUpdate(command(`/allow ${STRANGER_ID}`, ADMIN_ID));
-    expect(String(sent.at(-1)?.payload.text)).toContain("허용했어");
+    expect(bodyOf(sent.at(-1))).toContain("허용했어");
     expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID] });
 
     const reloaded = await Access.load(accessFile, cfg.allowedUserIds, cfg.adminUserIds);
@@ -654,7 +658,7 @@ describe("telegram flow", () => {
   test("non-admins cannot /allow, even allowed users", async () => {
     const { bot, sent, accessFile } = await setup();
     await bot.handleUpdate(command(`/allow ${STRANGER_ID}`, OWNER_ID));
-    expect(String(sent.at(-1)?.payload.text)).toContain("관리자만");
+    expect(bodyOf(sent.at(-1))).toContain("관리자만");
     expect(await Bun.file(accessFile).exists()).toBe(false);
   });
 
@@ -663,7 +667,7 @@ describe("telegram flow", () => {
     const update = command("/allow", ADMIN_ID, group(GROUP_ID)) as Update & { message: Record<string, unknown> };
     update.message.reply_to_message = { message_id: 1, date: 0, chat: group(GROUP_ID), from: from(STRANGER_ID), text: "hi", reply_to_message: undefined };
     await bot.handleUpdate(update);
-    expect(String(sent.at(-1)?.payload.text)).toContain(`${STRANGER_ID} 허용했어`);
+    expect(bodyOf(sent.at(-1))).toContain(`${STRANGER_ID} 허용했어`);
     expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID] });
   });
 
@@ -671,7 +675,7 @@ describe("telegram flow", () => {
     const { bot, sent, accessFile } = await setup();
     await bot.handleUpdate(command("/start", STRANGER_ID));
     await bot.handleUpdate(command("/deploy x/y", STRANGER_ID));
-    const requests = sent.filter((s) => s.method === "sendMessage" && s.payload.chat_id === ADMIN_ID);
+    const requests = sent.filter((s) => isOutbound(s) && s.payload.chat_id === ADMIN_ID);
     expect(requests).toHaveLength(1);
     const approve = buttons(requests[0]).find((b) => b.text === "허용");
     expect(approve).toMatchObject({ callback_data: `acl:add:${STRANGER_ID}`, style: "success" });
@@ -681,6 +685,10 @@ describe("telegram flow", () => {
 
     await bot.handleUpdate(click(approve?.callback_data ?? "", ADMIN_ID));
     expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID] });
-    expect(sent.at(-1)).toMatchObject({ method: "sendMessage", payload: { chat_id: STRANGER_ID } });
+    const settled = lastWith(sent, (s) => s.method === "editMessageText");
+    expect(bodyOf(settled)).toContain("허용함");
+    expect(buttons(settled)).toEqual([]);
+    expect(sent.at(-1)).toMatchObject({ payload: { chat_id: STRANGER_ID } });
+    expect(isOutbound(sent.at(-1) as Sent)).toBe(true);
   });
 });
