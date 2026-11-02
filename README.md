@@ -10,9 +10,10 @@ A Telegram bot that deploys GitHub repos to Dokploy with one command.
    - `docker-compose.yml` / `compose.yaml` → Dokploy Compose (the domain attaches to the `web`/`app`/`frontend`… service, or to the first service that has ports)
    - `Dockerfile` → Dockerfile build (port taken from `EXPOSE`)
    - Neither → **Railpack**. If the Railpack build fails, an AI writes a Dockerfile, the bot injects it as `Dockerfile.deploy-bot` through a Dokploy Patch, and the build is retried.
-2. A single message walks you through the choices with buttons: **project** (suggests a new project named after the repo, or pick an existing one, or type a name) → **environment** (existing ones, `+ staging` / `+ dev`, or type a name; missing ones are created) → **domain** (`<repo>.arpa.page`, your own, or none) → **confirm**.
-3. After you press 🚀, one live message shows each step and the last lines of the build log while it runs.
-4. The result message has buttons: open the site, open it in Dokploy, copy the URL, full build log, runtime log, update, rebuild. Failures show the end of the build log in a collapsible block.
+2. A single message walks you through the choices with buttons: **build** (⭐ recommended from what the repo has: Compose, Dockerfile, Railpack; also Nixpacks, Heroku, Paketo, Static, or "AI writes a Dockerfile") → **project** (suggests a new project named after the repo, or pick an existing one, or type a name) → **environment** (existing ones, `+ staging` / `+ dev`, or type a name; missing ones are created) → **domain** (`<repo>.arpa.page`, `<repo>-<env>.arpa.page` outside production, your own, or none) → **confirm**.
+3. After you press 🚀, one live message shows each step, the elapsed time, and the last lines of the build log while it runs. The wizard's button turns into a disabled "⏳ 배포 진행 중..." and then "✅ 배포 완료" / "❌ 배포 실패".
+4. The result is a rich message (table + collapsible log) with buttons: open the site, open it in Dokploy, copy the URL, build log, runtime log, update, rebuild.
+5. Everything the bot sends stays in the forum topic where the command was typed.
 
 | Command | What it does |
 |---|---|
@@ -47,6 +48,14 @@ bun run typecheck
 ```
 
 Deploying on Dokploy: this repo has a `Dockerfile`, so you can register it as a Dockerfile app in Dokploy, add the environment variables, and deploy. It needs no domain (it uses long polling). Port 3000 only serves a health check (`ok`).
+
+## Cloudflare
+
+Behind the Cloudflare proxy with SSL mode **Flexible**, set `DOMAIN_TLS=cloudflare`. Cloudflare talks to Dokploy over plain HTTP, so the Dokploy domain must have HTTPS off (otherwise Traefik redirects http to https forever). The bot then creates the domain with HTTPS off and still shows `https://` links. With `DOMAIN_TLS=letsencrypt` it asks Dokploy for a Let's Encrypt certificate instead.
+
+## Group topics and admin rights
+
+Messages are sent into the topic where the command was typed. Ephemeral (only-you) replies need the bot to be a group admin; without it the bot falls back to normal messages.
 
 ## Notes
 

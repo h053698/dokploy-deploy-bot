@@ -1,3 +1,5 @@
+export type AppBuildType = "dockerfile" | "railpack" | "nixpacks" | "heroku_buildpacks" | "paketo_buildpacks" | "static";
+
 export type BuildPlan =
   | {
       kind: "compose";
@@ -9,12 +11,38 @@ export type BuildPlan =
     }
   | {
       kind: "application";
-      buildType: "dockerfile" | "railpack";
+      buildType: AppBuildType;
       dockerfile: string | null;
+      generateDockerfile?: boolean;
       port: number;
       setPortEnv: boolean;
       warnings: string[];
     };
+
+export type BuildChoice = "compose" | "dockerfile" | "ai_dockerfile" | "railpack" | "nixpacks" | "heroku_buildpacks" | "paketo_buildpacks" | "static";
+
+export const BUILD_LABELS: Record<BuildChoice, string> = {
+  compose: "🐳 Docker Compose",
+  dockerfile: "🐳 Dockerfile",
+  ai_dockerfile: "🤖 AI가 Dockerfile 생성",
+  railpack: "🚂 Railpack",
+  nixpacks: "❄️ Nixpacks",
+  heroku_buildpacks: "🟣 Heroku Buildpacks",
+  paketo_buildpacks: "📦 Paketo Buildpacks",
+  static: "📄 Static (nginx)",
+};
+
+export interface BuildOptions {
+  detected: BuildPlan;
+  composePlan: Extract<BuildPlan, { kind: "compose" }> | null;
+  dockerfilePlan: Extract<BuildPlan, { kind: "application" }> | null;
+  autoPort: number;
+  recommended: BuildChoice;
+  choices: BuildChoice[];
+}
+
+const STATIC_PORT = 80;
+const BUILDPACK_PORT = 8080;
 
 const COMPOSE_NAMES = ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"];
 const WEB_SERVICE_HINTS = ["web", "app", "frontend", "front", "server", "api", "backend", "site", "nginx"];
@@ -110,6 +138,40 @@ export function guessRailpackPort(files: string[]): number {
 export type ReadFile = (path: string) => Promise<string | null>;
 
 export async function analyzeRepo(files: string[], readFile: ReadFile): Promise<BuildPlan> {
+  return (await buildOptions(files, readFile)).detected;
+}
+
+export async function buildOptions(files: string[], readFile: ReadFile): Promise<BuildOptions> {
+  const composePlan = await detectCompose(files, readFile);
+  const dockerfilePlan = await detectDockerfile(files, readFile);
+  const autoPort = guessRailpackPort(files);
+  const railpack: BuildPlan = { kind: "application", buildType: "railpack", dockerfile: null, port: autoPort, setPortEnv: true, warnings: [] };
+  const detected = composePlan ?? dockerfilePlan ?? railpack;
+  const recommended: BuildChoice = composePlan ? "compose" : dockerfilePlan ? "dockerfile" : "railpack";
+  const choices: BuildChoice[] = [
+    ...(composePlan ? (["compose"] as const) : []),
+    ...(dockerfilePlan ? (["dockerfile"] as const) : (["ai_dockerfile"] as const)),
+    "railpack",
+    "nixpacks",
+    "heroku_buildpacks",
+    "paketo_buildpacks",
+    "static",
+  ];
+  return { detected, composePlan, dockerfilePlan, autoPort, recommended, choices };
+}
+
+export function planFor(options: BuildOptions, choice: BuildChoice): BuildPlan {
+  if (choice === "compose" && options.composePlan) return options.composePlan;
+  if (choice === "dockerfile" && options.dockerfilePlan) return options.dockerfilePlan;
+  const base = { kind: "application" as const, dockerfile: null, setPortEnv: true, warnings: [] as string[] };
+  if (choice === "ai_dockerfile") return { ...base, buildType: "dockerfile", generateDockerfile: true, port: options.autoPort };
+  if (choice === "static") return { ...base, buildType: "static", port: STATIC_PORT, setPortEnv: false };
+  if (choice === "heroku_buildpacks" || choice === "paketo_buildpacks") return { ...base, buildType: choice, port: BUILDPACK_PORT };
+  if (choice === "nixpacks") return { ...base, buildType: "nixpacks", port: options.autoPort };
+  return { ...base, buildType: "railpack", port: options.autoPort };
+}
+
+async function detectCompose(files: string[], readFile: ReadFile): Promise<Extract<BuildPlan, { kind: "compose" }> | null> {
   const composePath = findComposeFile(files);
   if (composePath) {
     const yaml = await readFile(composePath);
@@ -131,7 +193,10 @@ export async function analyzeRepo(files: string[], readFile: ReadFile): Promise<
       };
     }
   }
+  return null;
+}
 
+async function detectDockerfile(files: string[], readFile: ReadFile): Promise<Extract<BuildPlan, { kind: "application" }> | null> {
   const dockerfile = findDockerfile(files);
   if (dockerfile) {
     const content = await readFile(dockerfile);
@@ -145,15 +210,7 @@ export async function analyzeRepo(files: string[], readFile: ReadFile): Promise<
       warnings: port === null ? [`Dockerfile에 EXPOSE가 없어서 포트 ${DEFAULT_PORT}로 가정했어`] : [],
     };
   }
-
-  return {
-    kind: "application",
-    buildType: "railpack",
-    dockerfile: null,
-    port: guessRailpackPort(files),
-    setPortEnv: true,
-    warnings: [],
-  };
+  return null;
 }
 
 export function subdomainFor(repo: string): string {

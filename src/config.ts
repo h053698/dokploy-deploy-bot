@@ -68,7 +68,7 @@ export interface Config {
   dokployApiKey: string;
   dokployServerId: string | null;
   baseDomain: string;
-  https: boolean;
+  domainTls: DomainTls;
   railpackVersion: string;
   githubApiUrl: string;
   githubToken: string | null;
@@ -96,6 +96,24 @@ function positiveInt(env: Env, key: string, fallback: number): number {
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${key} must be a positive integer, got "${raw}"`);
   return value;
+}
+
+export type DomainTls = "letsencrypt" | "cloudflare" | "none";
+
+function domainTls(env: Env): DomainTls {
+  const raw = optional(env, "DOMAIN_TLS")?.toLowerCase() ?? ((optional(env, "DOMAIN_HTTPS") ?? "true") === "false" ? "none" : "letsencrypt");
+  if (raw !== "letsencrypt" && raw !== "cloudflare" && raw !== "none") {
+    throw new Error(`DOMAIN_TLS must be letsencrypt, cloudflare or none, got "${raw}"`);
+  }
+  return raw;
+}
+
+export const publicUrl = (cfg: Pick<Config, "domainTls">, host: string) => `${cfg.domainTls === "none" ? "http" : "https"}://${host}`;
+
+export function dokployDomainTls(cfg: Pick<Config, "domainTls">) {
+  return cfg.domainTls === "letsencrypt"
+    ? { https: true, certificateType: "letsencrypt" as const }
+    : { https: false, certificateType: "none" as const };
 }
 
 function idSet(env: Env, key: string): Set<number> {
@@ -129,7 +147,7 @@ export function loadConfig(env: Env = process.env): Config {
     dokployApiKey: required(env, "DOKPLOY_API_KEY"),
     dokployServerId: optional(env, "DOKPLOY_SERVER_ID"),
     baseDomain: (optional(env, "BASE_DOMAIN") ?? "arpa.page").replace(/^\.+/, ""),
-    https: (optional(env, "DOMAIN_HTTPS") ?? "true") !== "false",
+    domainTls: domainTls(env),
     railpackVersion: optional(env, "RAILPACK_VERSION") ?? "0.15.4",
     githubApiUrl: (optional(env, "GITHUB_API_URL") ?? "https://api.github.com").replace(/\/+$/, ""),
     githubToken: optional(env, "GITHUB_TOKEN"),

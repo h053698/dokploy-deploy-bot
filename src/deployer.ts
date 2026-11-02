@@ -1,7 +1,7 @@
 import { lookup } from "node:dns/promises";
 import { generateDockerfile } from "./ai.ts";
-import type { BuildPlan } from "./analyze.ts";
-import type { Config } from "./config.ts";
+import type { AppBuildType, BuildPlan } from "./analyze.ts";
+import { type Config, dokployDomainTls, publicUrl } from "./config.ts";
 import type { DkDeployment, DkDomain, DkGithubProvider, DkGithubRepo, DkPatch, Dokploy, FetchLike } from "./dokploy.ts";
 import { type GitHub, type RepoInfo, type RepoRef, repoKey } from "./github.ts";
 
@@ -53,6 +53,7 @@ export interface DeployResult extends RunOutcome {
   service: ManagedService;
   url: string | null;
   usedAiDockerfile: boolean;
+  buildLabel?: string;
 }
 
 export interface Reporter {
@@ -255,17 +256,11 @@ export class Deployer {
   }
 
   private url(host: string) {
-    return `${this.cfg.https ? "https" : "http"}://${host}`;
+    return publicUrl(this.cfg, host);
   }
 
   private domainBody(host: string, port: number) {
-    return {
-      host,
-      path: "/",
-      port,
-      https: this.cfg.https,
-      certificateType: this.cfg.https ? "letsencrypt" : "none",
-    };
+    return { host, path: "/", port, ...dokployDomainTls(this.cfg) };
   }
 
   async deploy(req: DeployRequest, reporter: Reporter): Promise<DeployResult> {
@@ -330,7 +325,13 @@ export class Deployer {
           enableSubmodules: false,
         });
       }
-      await this.saveBuildType(app.applicationId, plan.buildType, plan.dockerfile);
+      if (plan.generateDockerfile) {
+        if (!this.cfg.ai) throw new Error("AI 키가 없어서 Dockerfile을 만들 수 없어. OLLAMA/MISTRAL/OPENROUTER 키 중 하나를 넣어줘");
+        await reporter.step("AI가 Dockerfile 만드는 중");
+        await this.injectAiDockerfile(service, req, plan.port, null, null, reporter, null);
+      } else {
+        await this.saveBuildType(app.applicationId, plan.buildType, plan.dockerfile);
+      }
       if (plan.setPortEnv) {
         await this.dk.post("application.saveEnvironment", {
           applicationId: app.applicationId,
@@ -340,7 +341,7 @@ export class Deployer {
           createEnvFile: false,
         });
       }
-      await reporter.step(`앱 만들고 소스 연결 (${sourceLabel}) · ${plan.buildType === "railpack" ? `Railpack ${this.cfg.railpackVersion}` : `Dockerfile ${plan.dockerfile}`}`);
+      await reporter.step(`앱 만들고 소스 연결 (${sourceLabel}) · ${this.buildLabel(plan)}`);
       if (req.domain) {
         await this.dk.post("domain.create", {
           ...this.domainBody(req.domain, plan.port),
@@ -353,11 +354,12 @@ export class Deployer {
 
     await reporter.step("빌드 시작");
     let outcome = await this.runAndWait(service, "deploy", reporter);
-    let usedAiDockerfile = false;
+    let usedAiDockerfile = plan.kind === "application" && plan.generateDockerfile === true;
 
-    if (outcome.status === "error" && plan.kind === "application" && plan.buildType === "railpack") {
+    const autoBuilder = plan.kind === "application" && !plan.generateDockerfile && plan.buildType !== "dockerfile";
+    if (outcome.status === "error" && autoBuilder) {
       if (!this.cfg.ai) {
-        await reporter.step("Railpack 빌드 실패. AI 키가 없어서 Dockerfile 자동 생성은 건너뜀");
+        await reporter.step("빌드 실패. AI 키가 없어서 Dockerfile 자동 생성은 건너뜀");
       } else {
         const result = await this.aiFallback(service, req, plan.port, outcome.logTail, reporter);
         outcome = result.outcome;
@@ -369,21 +371,70 @@ export class Deployer {
       ...outcome,
       service,
       url: req.domain ? this.url(req.domain) : null,
+      buildLabel: plan.kind === "compose" ? `Docker Compose ${plan.composePath}` : this.buildLabel(plan),
       usedAiDockerfile,
       logTail: outcome.status === "done" ? null : outcome.logTail,
     };
   }
 
-  private async saveBuildType(applicationId: string, buildType: "dockerfile" | "railpack", dockerfile: string | null) {
+  private buildLabel(plan: Extract<BuildPlan, { kind: "application" }>): string {
+    if (plan.generateDockerfile) return "AI Dockerfile";
+    if (plan.buildType === "railpack") return `Railpack ${this.cfg.railpackVersion}`;
+    if (plan.buildType === "dockerfile") return `Dockerfile ${plan.dockerfile}`;
+    return plan.buildType;
+  }
+
+  private async saveBuildType(applicationId: string, buildType: AppBuildType, dockerfile: string | null) {
     await this.dk.post("application.saveBuildType", {
       applicationId,
       buildType,
       dockerfile: dockerfile ?? "Dockerfile",
       dockerContextPath: null,
       dockerBuildStage: null,
-      herokuVersion: null,
+      herokuVersion: buildType === "heroku_buildpacks" ? "24" : null,
       railpackVersion: this.cfg.railpackVersion,
+      publishDirectory: null,
+      isStaticSpa: buildType === "static" ? true : null,
     });
+  }
+
+  private patchIds = new Map<string, string>();
+
+  private async injectAiDockerfile(
+    service: ManagedService,
+    req: DeployRequest,
+    port: number,
+    failureLog: string | null,
+    previous: string | null,
+    reporter: Reporter,
+    attempt: { n: number; of: number } | null,
+  ): Promise<string> {
+    const ai = this.cfg.ai;
+    if (!ai) throw new Error("AI is not configured");
+    const readFile = (path: string) => this.gh.fileOrNull(req.repo, req.repo.defaultBranch, path);
+    if (attempt) await reporter.step(`빌드 실패 → AI가 Dockerfile 만드는 중 (${attempt.n}/${attempt.of})`);
+    const generated = await generateDockerfile(
+      ai,
+      { repo: repoKey(req.repo), files: req.files, readFile, port, failureLog, previousDockerfile: previous },
+      this.aiFetch,
+    );
+    for (const failure of generated.failures) await reporter.step(`AI 제공자 실패, 다음으로 넘김 (${failure.split(":")[0]})`);
+    await reporter.step(`${generated.provider} (${generated.model})가 Dockerfile 생성`);
+    const patchId = this.patchIds.get(service.id);
+    if (patchId) {
+      await this.dk.post("patch.update", { patchId, content: generated.dockerfile, type: "create", enabled: true });
+    } else {
+      const patch = await this.dk.post<DkPatch>("patch.create", {
+        applicationId: service.id,
+        filePath: AI_DOCKERFILE,
+        content: generated.dockerfile,
+        type: "create",
+        enabled: true,
+      });
+      this.patchIds.set(service.id, patch.patchId);
+      await this.saveBuildType(service.id, "dockerfile", AI_DOCKERFILE);
+    }
+    return generated.dockerfile;
   }
 
   private async aiFallback(
@@ -395,47 +446,15 @@ export class Deployer {
   ): Promise<{ outcome: RunOutcome; used: boolean }> {
     const ai = this.cfg.ai;
     if (!ai) throw new Error("AI is not configured");
-    const readFile = (path: string) => this.gh.fileOrNull(req.repo, req.repo.defaultBranch, path);
     let log = firstLog;
     let previous: string | null = null;
-    let patchId: string | null = null;
     let outcome: RunOutcome = { status: "error", logTail: firstLog, deploymentId: null };
-
-    for (let attempt = 1; attempt <= ai.maxAttempts; attempt++) {
-      await reporter.step(`Railpack 실패 → AI가 Dockerfile 만드는 중 (${attempt}/${ai.maxAttempts})`);
-      const generated = await generateDockerfile(
-        ai,
-        {
-          repo: repoKey(req.repo),
-          files: req.files,
-          readFile,
-          port,
-          failureLog: log,
-          previousDockerfile: previous,
-        },
-        this.aiFetch,
-      );
-      const { dockerfile } = generated;
-      for (const failure of generated.failures) await reporter.step(`AI 제공자 실패, 다음으로 넘김 (${failure.split(":")[0]})`);
-      await reporter.step(`${generated.provider} (${generated.model})가 Dockerfile 생성`);
-      if (patchId) {
-        await this.dk.post("patch.update", { patchId, content: dockerfile, type: "create", enabled: true });
-      } else {
-        const patch = await this.dk.post<DkPatch>("patch.create", {
-          applicationId: service.id,
-          filePath: AI_DOCKERFILE,
-          content: dockerfile,
-          type: "create",
-          enabled: true,
-        });
-        patchId = patch.patchId;
-        await this.saveBuildType(service.id, "dockerfile", AI_DOCKERFILE);
-      }
+    for (let n = 1; n <= ai.maxAttempts; n++) {
+      previous = await this.injectAiDockerfile(service, req, port, log, previous, reporter, { n, of: ai.maxAttempts });
       await reporter.step(`${AI_DOCKERFILE} 넣고 다시 빌드`);
       outcome = await this.runAndWait(service, "deploy", reporter);
       if (outcome.status !== "error") return { outcome, used: true };
       log = outcome.logTail;
-      previous = dockerfile;
     }
     return { outcome, used: true };
   }
@@ -453,8 +472,9 @@ export class Deployer {
     await this.dk.post(`${service.kind}.${mode}`, { ...idField, title: `deploy-bot ${mode}` });
 
     const deadline = this.now() + this.cfg.deployTimeoutMs;
+    const maxPolls = Math.ceil(this.cfg.deployTimeoutMs / this.cfg.pollIntervalMs) + 1;
     let current: DkDeployment | undefined;
-    while (this.now() < deadline) {
+    for (let poll = 0; poll < maxPolls && this.now() < deadline; poll++) {
       await this.sleep(this.cfg.pollIntervalMs);
       current = (await this.deployments(service)).find((d) => !before.has(d.deploymentId));
       if (!current) continue;
