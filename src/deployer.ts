@@ -1,4 +1,5 @@
 import { generateDockerfile } from "./ai.ts";
+import { classifyWithAi, detectFault, errorLines, parseNameMaps, parsePortMaps, pickFreeName, pickFreePort, renderPortPatch } from "./logfix.ts";
 import type { AppBuildType, BuildPlan } from "./analyze.ts";
 import { checkDomain, type DnsReport, type DnsState, type Resolver, serverAddresses, systemResolver } from "./dns.ts";
 import { type Config, dokployDomainTls, publicUrl } from "./config.ts";
@@ -75,6 +76,22 @@ export function repoFromDescription(description: string | null): string | null {
 }
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const MAX_COMPOSE_FIXES = 2;
+
+export const uniqueSuffix = (appName: string): string => appName.split("-").pop()?.slice(0, 8) || Math.random().toString(36).slice(2, 8);
+
+interface ComposeSource {
+  ref: RepoRef;
+  branch: string;
+  path: string;
+}
+
+interface PatchRow {
+  patchId: string;
+  filePath: string;
+  content: string;
+}
 
 export interface DeployerHooks {
   sleep?: (ms: number) => Promise<void>;
@@ -168,6 +185,12 @@ export class Deployer {
     const serverIps = await serverAddresses(this.cfg.dokployUrl, this.resolver);
     const report = await checkDomain(host, serverIps, this.resolver);
     return { ...report, serverIps: [...serverIps] };
+  }
+
+  async latestDeploymentId(service: ManagedService): Promise<string | null> {
+    const list = await this.deployments(service).catch(() => []);
+    const newest = [...list].sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")))[0];
+    return newest?.deploymentId ?? null;
   }
 
   async usedHosts(): Promise<Set<string>> {
@@ -366,6 +389,11 @@ export class Deployer {
       }
     }
 
+    if (outcome.status === "error" && plan.kind === "compose") {
+      const src: ComposeSource = { ref: { owner: repo.owner, repo: repo.repo }, branch: repo.defaultBranch, path: plan.composePath };
+      outcome = await this.repairCompose(service, src, outcome, reporter);
+    }
+
     return {
       ...outcome,
       service,
@@ -398,6 +426,121 @@ export class Deployer {
   }
 
   private patchIds = new Map<string, string>();
+
+  async usedHostPorts(): Promise<Set<number>> {
+    const rows = await this.dk.get<{ ports?: string }[]>("docker.getContainers").catch(() => []);
+    const used = new Set<number>([80, 443]);
+    const own = Number(new URL(this.cfg.dokployUrl).port);
+    if (own) used.add(own);
+    for (const row of rows) {
+      for (const m of (row.ports ?? "").matchAll(/(?:\d+\.\d+\.\d+\.\d+|\[[\da-f:]*\]):(\d+)->/gi)) used.add(Number(m[1]));
+    }
+    return used;
+  }
+
+  private async composeSource(service: ManagedService): Promise<ComposeSource | null> {
+    const one = await this.dk.get<{ owner?: string | null; repository?: string | null; composePath?: string | null; branch?: string | null; customGitBranch?: string | null }>("compose.one", { composeId: service.id });
+    const [ownerFromName, repoFromName] = service.repo.split("/");
+    const owner = one.owner || ownerFromName;
+    const repo = one.repository || repoFromName;
+    if (!owner || !repo) return null;
+    return { ref: { owner, repo }, branch: one.branch || one.customGitBranch || "main", path: one.composePath || "docker-compose.yml" };
+  }
+
+  private async portPatch(service: ManagedService, path: string): Promise<PatchRow | null> {
+    const rows = await this.dk.get<PatchRow[]>("patch.byEntityId", { id: service.id, type: service.kind }).catch(() => []);
+    const target = path.replace(/^\.\//, "");
+    return (Array.isArray(rows) ? rows : []).find((row) => row.filePath === target && typeof row.content === "string" && (parsePortMaps(row.content).size > 0 || parseNameMaps(row.content).size > 0)) ?? null;
+  }
+
+  async usedContainerNames(): Promise<Set<string>> {
+    const rows = await this.dk.get<{ name?: string }[]>("docker.getContainers").catch(() => []);
+    return new Set((Array.isArray(rows) ? rows : []).map((row) => (row.name ?? "").replace(/^\//, "")).filter(Boolean));
+  }
+
+  async rerun(service: ManagedService, mode: "deploy" | "redeploy", reporter: Reporter): Promise<RunOutcome> {
+    if (service.kind !== "compose") return this.runAndWait(service, mode, reporter);
+    const src = await this.composeSource(service).catch(() => null);
+    if (src && mode === "deploy") await this.refreshPortPatch(service, src, reporter);
+    const outcome = await this.runAndWait(service, mode, reporter);
+    return outcome.status === "error" && src ? this.repairCompose(service, src, outcome, reporter) : outcome;
+  }
+
+  private async refreshPortPatch(service: ManagedService, src: ComposeSource, reporter: Reporter): Promise<void> {
+    const filePath = src.path.replace(/^\.\//, "");
+    const existing = await this.portPatch(service, filePath);
+    if (!existing) return;
+    const upstream = await this.gh.fileOrNull(src.ref, src.branch, filePath).catch(() => null);
+    if (upstream === null) return;
+    const fresh = renderPortPatch(upstream, parsePortMaps(existing.content), parseNameMaps(existing.content));
+    if (fresh === null) {
+      await this.dk.post("patch.delete", { patchId: existing.patchId });
+      await reporter.step("compose의 포트·이름 구성이 바뀌어서 예전 수정을 지웠어");
+      return;
+    }
+    if (fresh !== existing.content) {
+      await this.dk.post("patch.update", { patchId: existing.patchId, content: fresh, type: "update", enabled: true });
+      await reporter.step("최신 compose에 포트·이름 수정을 다시 적용했어");
+    }
+  }
+
+  private async repairCompose(service: ManagedService, src: ComposeSource, first: RunOutcome, reporter: Reporter): Promise<RunOutcome> {
+    const filePath = src.path.replace(/^\.\//, "");
+    const upstream = await this.gh.fileOrNull(src.ref, src.branch, filePath).catch(() => null);
+    let outcome = first;
+    for (let attempt = 1; attempt <= MAX_COMPOSE_FIXES; attempt++) {
+      const lines = errorLines(outcome.logTail ?? "");
+      if (lines.length === 0) return outcome;
+      let fault = detectFault(lines);
+      if (fault.kind === "unknown" && this.cfg.ai) {
+        const verdict = await classifyWithAi(this.cfg.ai, lines, this.aiFetch);
+        if (verdict?.fault.kind === "port_conflict") {
+          fault = verdict.fault;
+          await reporter.step(`AI가 error 줄을 보고 포트 충돌로 판단 (${verdict.provider})`);
+        }
+      }
+      if (fault.kind === "unknown") return outcome;
+      if (upstream === null) {
+        await reporter.step(`충돌을 찾았지만 ${filePath}를 읽지 못해서 자동으로 못 고쳐`);
+        return outcome;
+      }
+      const existing = await this.portPatch(service, filePath);
+      const ports = existing ? parsePortMaps(existing.content) : new Map<number, number>();
+      const names = existing ? parseNameMaps(existing.content) : new Map<string, string>();
+      let message: string;
+      if (fault.kind === "port_conflict") {
+        const original = [...ports].find(([, to]) => to === fault.port)?.[0] ?? fault.port;
+        const used = await this.usedHostPorts();
+        used.add(fault.port);
+        for (const to of ports.values()) used.add(to);
+        const next = pickFreePort(fault.port, used);
+        ports.set(original, next);
+        message = `호스트 포트 ${fault.port} 충돌 → ${next}로 바꿔서 다시 배포`;
+      } else {
+        const original = [...names].find(([, to]) => to === fault.name)?.[0] ?? fault.name;
+        const used = await this.usedContainerNames();
+        used.add(fault.name);
+        for (const to of names.values()) used.add(to);
+        const next = pickFreeName(original, uniqueSuffix(service.appName), used);
+        names.set(original, next);
+        message = `컨테이너 이름 ${fault.name} 충돌 → ${next}로 바꿔서 다시 배포`;
+      }
+      const content = renderPortPatch(upstream, ports, names);
+      if (content === null) {
+        await reporter.step(`충돌 대상이 ${filePath}에 직접 적혀 있지 않아서 자동으로 못 고쳐 (환경변수로 받는 값일 수 있어)`);
+        return outcome;
+      }
+      if (existing) {
+        await this.dk.post("patch.update", { patchId: existing.patchId, content, type: "update", enabled: true });
+      } else {
+        await this.dk.post<DkPatch>("patch.create", { composeId: service.id, filePath, content, type: "update", enabled: true });
+      }
+      await reporter.step(`${message} (${attempt}/${MAX_COMPOSE_FIXES})`);
+      outcome = await this.runAndWait(service, "deploy", reporter);
+      if (outcome.status !== "error") return outcome;
+    }
+    return outcome;
+  }
 
   private async injectAiDockerfile(
     service: ManagedService,
