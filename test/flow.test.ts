@@ -61,6 +61,7 @@ class FakeDokploy {
   };
 
   domainHosts: string[] = [];
+  noDomains = false;
 
   addDomain(host: string) {
     this.domainHosts.push(host);
@@ -157,7 +158,7 @@ class FakeDokploy {
       case "overview.domains":
         return this.domainHosts.map((host) => ({ host }));
       case "domain.byApplicationId":
-        return [{ domainId: "dom1", host: "hello.example.test", https: true, port: 3000 }];
+        return this.noDomains ? [] : [{ domainId: "dom1", host: "hello.example.test", https: true, port: 3000 }];
       default:
         return true;
     }
@@ -348,8 +349,8 @@ describe("telegram flow", () => {
     await bot.handleUpdate(press(w, "hello.example.test (추천)"));
     w = wizard(sent);
     expect(bodyOf(w)).toContain("이대로 올릴까?");
-    expect(bodyOf(w)).toContain("프로젝트 <b>hello</b> <i>(새로 만듦)</i>");
-    expect(bodyOf(w)).toContain("환경 <b>production</b>");
+    expect(bodyOf(w)).toContain("<td><b>프로젝트</b></td><td><b>hello</b> <i>(새로 만듦)</i></td>");
+    expect(bodyOf(w)).toContain("<td><b>환경</b></td><td><b>production</b>");
     expect(bodyOf(w)).toContain("<code>https://hello.example.test</code>");
     expect(buttons(w)[0]).toMatchObject({ text: "배포하기", style: "success" });
 
@@ -500,6 +501,58 @@ describe("telegram flow", () => {
     expect(bodyOf(wizard(sent))).toContain("서버로 바로 연결돼 있어");
   });
 
+  test("/list rows open a management panel in place with the result-card actions, and a back button returns to the list", async () => {
+    const { bot, dk, sent } = await setup();
+    const p = dk.addProject("team", ["production", "staging"]);
+    dk.addApp("hello", p.envs[0]?.environmentId ?? "");
+    dk.addApp("hello-api", p.envs[1]?.environmentId ?? "");
+    dk.deployments.push({ deploymentId: "dep1", applicationId: `id-hello-${p.envs[0]?.environmentId}`, status: "done" });
+
+    await bot.handleUpdate(command("/list"));
+    const list = outbound(sent);
+    expect(buttons(list).map((b) => b.text)).toEqual(["acme/hello · production (정상)", "acme/hello-api · staging (정상)"]);
+
+    await bot.handleUpdate(press(list, /^acme\/hello · production/));
+    const panel = lastWith(sent, (s) => s.method === "editMessageText");
+    expect(bodyOf(panel)).toContain("acme/hello");
+    expect(bodyOf(panel)).toContain("team / production");
+    expect(bodyOf(panel)).toContain("https://hello.example.test");
+    const labels = buttons(panel).map((b) => b.text);
+    expect(labels).toEqual(["사이트 열기", "Dokploy", "URL 복사", "빌드 로그", "실행 로그", "업데이트", "다시 빌드", "새로고침", "목록으로"]);
+    expect(buttons(panel).find((b) => b.text === "빌드 로그")?.callback_data).toBe(`log:b:a:id-hello-${p.envs[0]?.environmentId}:dep1`);
+    expect(buttons(panel).find((b) => b.text === "사이트 열기")?.url).toBe("https://hello.example.test");
+
+    await bot.handleUpdate(press(panel, "목록으로"));
+    const back = lastWith(sent, (s) => s.method === "editMessageText");
+    expect(bodyOf(back)).toContain("관리 중인 서비스 (2)");
+    expect(buttons(back).length).toBe(2);
+  });
+
+  test("a panel for a service with no domain or deployments omits the site and build-log buttons", async () => {
+    const { bot, dk, sent } = await setup();
+    const p = dk.addProject("team");
+    dk.addApp("hello", p.envs[0]?.environmentId ?? "");
+    dk.noDomains = true;
+    await bot.handleUpdate(command("/list"));
+    await bot.handleUpdate(press(outbound(sent), /hello/));
+    const labels = buttons(lastWith(sent, (s) => s.method === "editMessageText")).map((b) => b.text);
+    expect(labels).toEqual(["Dokploy", "실행 로그", "업데이트", "다시 빌드", "새로고침", "목록으로"]);
+  });
+
+  test("once the deploy starts the wizard keeps its summary table but drops the question", async () => {
+    const { bot, sent } = await setup();
+    await bot.handleUpdate(command("/deploy acme/hello"));
+    await bot.handleUpdate(railpack(sent));
+    await bot.handleUpdate(press(wizard(sent), /^새 프로젝트/));
+    await bot.handleUpdate(press(wizard(sent), "도메인 없이"));
+    expect(bodyOf(wizard(sent))).toContain("이대로 올릴까?");
+    await bot.handleUpdate(press(wizard(sent), "배포하기"));
+    const frozen = lastWith(sent, (s) => s.method === "editMessageText" && buttons(s).some((b) => b.disabled));
+    expect(bodyOf(frozen)).toContain("<table");
+    expect(bodyOf(frozen)).not.toContain("이대로 올릴까?");
+    expect(bodyOf(frozen)).not.toContain("<tg-button type=\"callback_data\"");
+  });
+
   test("static choice uses the static builder on port 80 without a PORT env", async () => {
     const { bot, dk, sent, idle } = await setup();
     await bot.handleUpdate(command("/deploy acme/hello"));
@@ -535,8 +588,8 @@ describe("telegram flow", () => {
     await bot.handleUpdate(press(w, "＋ staging"));
     await bot.handleUpdate(press(wizard(sent), "도메인 없이"));
     w = wizard(sent);
-    expect(bodyOf(w)).toContain("환경 <b>staging</b> <i>(새로 만듦)</i>");
-    expect(bodyOf(w)).toContain("도메인 없음");
+    expect(bodyOf(w)).toContain("<td><b>환경</b></td><td><b>staging</b> <i>(새로 만듦)</i></td>");
+    expect(bodyOf(w)).toContain("<td><b>도메인</b></td><td>없음</td>");
     await bot.handleUpdate(press(w, "배포하기"));
     await idle();
     expect(dk.calls.find((c) => c.path === "environment.create")?.body).toMatchObject({ name: "staging", projectId: project.projectId });

@@ -115,6 +115,14 @@ function toRich(html: string): string {
     .join("");
 }
 
+function logCard(repo: string, subtitle: string, log: string | null, empty: string): { classic: string; rich: string } {
+  const body = log ? logBlock(log) : `<i>${esc(empty)}</i>`;
+  return {
+    classic: [bold(repo), esc(subtitle), body].join("\n"),
+    rich: `<h3>${esc(repo)}</h3><p>${esc(subtitle)}</p>` + (log ? richLog(log) : `<p>${esc(empty)}</p>`),
+  };
+}
+
 function toInline(rows: RichButton[][]): InlineKeyboard {
   const kb = new InlineKeyboard();
   for (const row of rows) {
@@ -281,31 +289,51 @@ export function dnsLines(host: string, dns: DnsReport & { serverIps: string[] },
   return [`DNS 확인: ${code(host)}가 아직 설정되지 않았어`, ...guide];
 }
 
-export function wizardText(w: Wizard, cfg: Pick<Config, "domainTls" | "railpackVersion">): string {
-  const lines = [`${bold(`${w.repo.owner}/${w.repo.repo}`)} · ${code(w.repo.defaultBranch)}`, "", stepBar(w.step), ""];
-  if (w.step !== "build") lines.push(`빌드 ${describePlan(w.plan, cfg.railpackVersion)} · 포트 ${w.plan.port}`);
-  if (w.target) lines.push(`프로젝트 ${bold(w.target.projectName)}${w.target.projectId ? "" : " <i>(새로 만듦)</i>"}`);
-  if (w.target && w.step !== "env" && w.step !== "project") {
-    lines.push(`환경 ${bold(w.target.environmentName)}${w.target.environmentId ? "" : " <i>(새로 만듦)</i>"}`);
+function planRows(plan: BuildPlan, railpackVersion: string): [string, string][] {
+  const rows: [string, string][] = [];
+  if (plan.kind === "compose") {
+    rows.push(["빌드", `Docker Compose ${code(plan.composePath)}`]);
+    rows.push(["도메인 연결", `${bold(plan.serviceName)} (전체 ${plan.services.length}개)`]);
+  } else {
+    rows.push(["빌드", describePlan(plan, railpackVersion)]);
   }
-  if (w.domain !== undefined) {
-    lines.push(`도메인 ${w.domain ? code(publicUrl(cfg, w.domain)) : "없음"}`);
-  }
-  for (const warning of w.plan.warnings) lines.push(`${esc(warning)}`);
-  if (w.domain && w.dns) lines.push(...dnsLines(w.domain, w.dns, cfg.domainTls));
-  if (w.step === "build") {
-    lines.push(`감지: ${describePlan(w.options.detected, cfg.railpackVersion)}`);
-    lines.push("어떻게 빌드할까?");
-  }
-  if (w.step === "project") lines.push("", w.awaiting === "project" ? "새 프로젝트 이름을 답장으로 보내줘" : "어느 Dokploy 프로젝트에 올릴까?");
-  if (w.step === "env") lines.push("", w.awaiting === "env" ? "새 환경 이름을 답장으로 보내줘" : "어느 환경(environment)에 올릴까?");
-  if (w.step === "domain") {
-    if (w.suggested?.plainTaken) lines.push("", `${code(w.suggested.plainTaken)}는 이미 쓰는 중이라 ${code(w.suggested.host)}를 추천해`);
-    lines.push("", w.awaiting === "domain" ? "도메인을 답장으로 보내줘" : "도메인은 어떻게 할까?");
-  }
-  if (w.step === "confirm") lines.push("", "이대로 올릴까?");
-  return lines.join("\n");
+  rows.push(["포트", String(plan.port)]);
+  return rows;
 }
+
+export function wizardView(w: Wizard, cfg: Pick<Config, "domainTls" | "railpackVersion">, frozen = false): { classic: string; rich: string } {
+  const header = `${bold(`${w.repo.owner}/${w.repo.repo}`)} · ${code(w.repo.defaultBranch)}`;
+  const rows: [string, string][] = [];
+  if (w.step !== "build") rows.push(...planRows(w.plan, cfg.railpackVersion));
+  if (w.target) rows.push(["프로젝트", `${bold(w.target.projectName)}${w.target.projectId ? "" : " <i>(새로 만듦)</i>"}`]);
+  if (w.target && w.step !== "env" && w.step !== "project") {
+    rows.push(["환경", `${bold(w.target.environmentName)}${w.target.environmentId ? "" : " <i>(새로 만듦)</i>"}`]);
+  }
+  if (w.domain !== undefined) rows.push(["도메인", w.domain ? code(publicUrl(cfg, w.domain)) : "없음"]);
+
+  const notes = [...w.plan.warnings.map((warning) => esc(warning)), ...(w.domain && w.dns ? dnsLines(w.domain, w.dns, cfg.domainTls) : [])];
+
+  const prompt: string[] = [];
+  if (!frozen) {
+    if (w.step === "build") prompt.push(`감지: ${describePlan(w.options.detected, cfg.railpackVersion)}`, "어떻게 빌드할까?");
+    if (w.step === "project") prompt.push(w.awaiting === "project" ? "새 프로젝트 이름을 답장으로 보내줘" : "어느 Dokploy 프로젝트에 올릴까?");
+    if (w.step === "env") prompt.push(w.awaiting === "env" ? "새 환경 이름을 답장으로 보내줘" : "어느 환경(environment)에 올릴까?");
+    if (w.step === "domain") {
+      if (w.suggested?.plainTaken) prompt.push(`${code(w.suggested.plainTaken)}는 이미 쓰는 중이라 ${code(w.suggested.host)}를 추천해`);
+      prompt.push(w.awaiting === "domain" ? "도메인을 답장으로 보내줘" : "도메인은 어떻게 할까?");
+    }
+    if (w.step === "confirm") prompt.push("이대로 올릴까?");
+  }
+
+  const classic = [header, "", stepBar(w.step), "", ...rows.map(([k, v]) => `${k} ${v}`), ...notes, ...(prompt.length ? ["", ...prompt] : [])].join("\n");
+  const table = rows.length
+    ? `<table bordered striped compact>${rows.map(([k, v]) => `<tr><td><b>${esc(k)}</b></td><td>${v}</td></tr>`).join("")}</table>`
+    : "";
+  const rich = toRich(`${header}\n\n${stepBar(w.step)}`) + table + (notes.length ? toRich(notes.join("\n")) : "") + (prompt.length ? toRich(prompt.join("\n\n")) : "");
+  return { classic, rich };
+}
+
+export const wizardText = (w: Wizard, cfg: Pick<Config, "domainTls" | "railpackVersion">) => wizardView(w, cfg).classic;
 
 type FullResult = DeployResult & { dashboard: string };
 
@@ -338,6 +366,47 @@ function resultRich(result: FullResult): string {
   if (ok && result.usedAiDockerfile) parts.push("<p>AI가 만든 <code>Dockerfile.deploy-bot</code>으로 빌드했어. Dokploy Patches에서 고칠 수 있어.</p>");
   if (!ok && result.logTail) parts.push("<p>빌드 로그 끝부분</p>", richLog(result.logTail));
   return parts.join("");
+}
+
+interface PanelInfo {
+  service: ManagedService;
+  url: string | null;
+  dashboard: string;
+  deploymentId: string | null;
+}
+
+function panelHtml(p: PanelInfo, statusWord: string): { classic: string; rich: string } {
+  const where = `${p.service.projectName} / ${p.service.environmentName}`;
+  const rows: [string, string][] = [
+    ["프로젝트 / 환경", where],
+    ["서비스", p.service.appName],
+    ["종류", p.service.kind === "compose" ? "compose" : "app"],
+    ["상태", statusWord],
+  ];
+  if (p.url) rows.push(["주소", p.url]);
+  const table = `<table bordered striped compact>${rows.map(([k, v]) => `<tr><td><b>${esc(k)}</b></td><td>${esc(v)}</td></tr>`).join("")}</table>`;
+  return {
+    rich: `<h3>${esc(p.service.repo)}</h3>${table}`,
+    classic: [bold(p.service.repo), esc(where), `상태 ${esc(statusWord)}`, ...(p.url ? [esc(p.url)] : [])].join("\n"),
+  };
+}
+
+function panelButtons(p: PanelInfo, busy: boolean): RichButton[][] {
+  const k = p.service.kind === "application" ? "a" : "c";
+  const top: RichButton[] = [];
+  if (p.url) top.push({ label: "사이트 열기", url: p.url, style: "success" });
+  top.push({ label: "Dokploy", url: p.dashboard });
+  if (p.url) top.push({ label: "URL 복사", copy: p.url });
+  const logs: RichButton[] = [];
+  if (p.deploymentId) logs.push({ label: "빌드 로그", data: `log:b:${k}:${p.service.id}:${p.deploymentId}` });
+  logs.push({ label: "실행 로그", data: `log:r:${k}:${p.service.id}` });
+  const runs: RichButton[] = busy
+    ? [{ label: "배포 진행 중", disabled: true }]
+    : [
+        { label: "업데이트", data: `run:u:${k}:${p.service.id}` },
+        { label: "다시 빌드", data: `run:r:${k}:${p.service.id}` },
+      ];
+  return [top, logs, runs, [{ label: "새로고침", data: `svc:${k}:${p.service.id}` }, { label: "목록으로", data: "svc:list" }]];
 }
 
 function resultButtons(result: FullResult): RichButton[][] {
@@ -436,7 +505,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     return deliver(ctx.api, place, html, rows);
   };
 
-  const say = (ctx: Context, html: string, rows: RichButton[][] = []) => deliver(ctx.api, whereOf(ctx), html, rows);
+  const say = (ctx: Context, content: string | { classic: string; rich: string }, rows: RichButton[][] = []) => deliver(ctx.api, whereOf(ctx), content, rows);
 
   const notifyAdmins = async (ctx: Context, userId: number) => {
     if (notifiedRequests.has(userId)) return;
@@ -611,15 +680,66 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
 
   const statusWord = (s: string) => ({ done: "정상", running: "배포 중", error: "실패", idle: "대기" })[s] ?? s;
 
-  bot.command("list", async (ctx) => {
+  const listView = async () => {
     const services = await deployer.listManaged();
-    if (services.length === 0) return notice(ctx, "아직 봇으로 배포한 서비스가 없어. /deploy &lt;github url&gt;");
+    if (services.length === 0) return null;
+    const buttons = services.map((s): RichButton[] => [
+      { label: `${s.repo} · ${s.environmentName} (${statusWord(s.status)})`, data: `svc:${s.kind === "application" ? "a" : "c"}:${s.id}` },
+    ]);
+    return { services, buttons };
+  };
+
+  const openPanel = async (service: ManagedService) => {
+    const [domains, deploymentId] = await Promise.all([
+      deployer.domainsOf(service).catch(() => []),
+      deployer.latestDeploymentId(service),
+    ]);
+    const first = domains[0];
+    const info: PanelInfo = {
+      service,
+      url: first ? publicUrl(cfg, first.host) : null,
+      dashboard: deployer.dashboardUrl(service),
+      deploymentId,
+    };
+    return { content: panelHtml(info, statusWord(service.status)), rows: panelButtons(info, busy.has(service.repo)) };
+  };
+
+  bot.command("list", async (ctx) => {
+    const view = await listView();
+    if (!view) return notice(ctx, "아직 봇으로 배포한 서비스가 없어. /deploy &lt;github url&gt;");
+    const { services } = view;
     const fallback = ["<b>관리 중인 서비스</b>", ...services.map((s) => `${esc(s.repo)} · ${esc(`${s.projectName}/${s.environmentName}`)} · ${statusWord(s.status)}`)].join("\n");
     const rows = services
       .map((s) => `<tr><td>${esc(s.repo)}</td><td>${esc(`${s.projectName} / ${s.environmentName}`)}</td><td>${s.kind === "compose" ? "compose" : "app"}</td><td>${statusWord(s.status)}</td></tr>`)
       .join("");
     const html = `<h3>관리 중인 서비스 (${services.length})</h3><table bordered striped compact><tr><th>레포</th><th>프로젝트 / 환경</th><th>종류</th><th>상태</th></tr>${rows}</table>`;
-    await deliver(ctx.api, whereOf(ctx), { classic: fallback, rich: html }, []);
+    await deliver(ctx.api, whereOf(ctx), { classic: fallback, rich: html }, view.buttons);
+  });
+
+  bot.callbackQuery(/^svc:(list|[ac]:.+)$/, async (ctx) => {
+    const target = ctx.match[1] ?? "";
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const place = whereOf(ctx);
+    if (target === "list") {
+      const view = await listView();
+      await ctx.answerCallbackQuery();
+      if (!view) return;
+      if (messageId === undefined) return;
+      const rows = view.services
+        .map((s) => `<tr><td>${esc(s.repo)}</td><td>${esc(`${s.projectName} / ${s.environmentName}`)}</td><td>${s.kind === "compose" ? "compose" : "app"}</td><td>${statusWord(s.status)}</td></tr>`)
+        .join("");
+      const html = `<h3>관리 중인 서비스 (${view.services.length})</h3><table bordered striped compact><tr><th>레포</th><th>프로젝트 / 환경</th><th>종류</th><th>상태</th></tr>${rows}</table>`;
+      const fallback = ["<b>관리 중인 서비스</b>", ...view.services.map((s) => `${esc(s.repo)} · ${esc(`${s.projectName}/${s.environmentName}`)} · ${statusWord(s.status)}`)].join("\n");
+      await redraw(ctx.api, place, messageId, { classic: fallback, rich: html }, view.buttons).catch(() => undefined);
+      return;
+    }
+    const [k = "", id = ""] = target.split(/:(.*)/s);
+    const service = await findService(k, id);
+    if (!service) return ctx.answerCallbackQuery({ text: "서비스를 찾을 수 없어" });
+    await ctx.answerCallbackQuery();
+    const panel = await openPanel(service);
+    if (messageId === undefined) return;
+    await redraw(ctx.api, place, messageId, panel.content, panel.rows).catch(() => undefined);
   });
 
   const wizardRows = (token: string, w: Wizard): RichButton[][] => {
@@ -667,12 +787,13 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
   const render = async (ctx: Context, token: string, w: Wizard, frozen: string | null = null) => {
     if (w.step === "domain") suggestDomain(w, cfg.baseDomain);
     const rows: RichButton[][] = frozen ? [[{ label: frozen, disabled: true }]] : wizardRows(token, w);
+    const view = wizardView(w, cfg, frozen !== null);
     try {
-      await ctx.api.editMessageText(w.place.chatId, w.messageId, { html: toRich(wizardText(w, cfg)) + richRows(rows) });
+      await ctx.api.editMessageText(w.place.chatId, w.messageId, { html: view.rich + richRows(rows) });
     } catch (error) {
       if (String(error).includes("message is not modified")) return;
       console.warn("[deploy-bot] rich wizard failed, falling back to HTML:", error instanceof Error ? error.message : error);
-      await ctx.api.editMessageText(w.place.chatId, w.messageId, wizardText(w, cfg), { ...HTML, reply_markup: toInline(rows) }).catch((err: unknown) => {
+      await ctx.api.editMessageText(w.place.chatId, w.messageId, view.classic, { ...HTML, reply_markup: toInline(rows) }).catch((err: unknown) => {
         if (!String(err).includes("message is not modified")) throw err;
       });
     }
@@ -927,7 +1048,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
         const label = mode === "update" ? "최신 코드로 업데이트" : "다시 빌드";
         const live = new LiveStatus(ctx.api, place, `${label} ${bold(service.repo)} · ${esc(`${service.projectName} / ${service.environmentName}`)}`);
         await live.step(mode === "update" ? "GitHub에서 최신 코드 받는 중" : "기존 코드로 빌드 시작");
-        const outcome: RunOutcome = await deployer.runAndWait(service, mode === "update" ? "deploy" : "redeploy", live);
+        const outcome: RunOutcome = await deployer.rerun(service, mode === "update" ? "deploy" : "redeploy", live);
         const domains = await deployer.domainsOf(service).catch(() => []);
         const first = domains[0];
         await finishRun(ctx, place, live, {
@@ -974,7 +1095,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     await ctx.replyWithChatAction("typing").catch(() => undefined);
     const log = await deployer.runtimeLog(service).catch((e: unknown) => `로그를 못 가져왔어: ${e instanceof Error ? e.message : String(e)}`);
     const k = service.kind === "application" ? "a" : "c";
-    await say(ctx, [`${bold(service.repo)} 실행 로그 <i>(최근)</i>`, log ? logBlock(log) : "<i>로그가 아직 없어</i>"].join("\n"), [
+    await say(ctx, logCard(service.repo, "실행 로그 · 최근", log, "로그가 아직 없어"), [
       [{ label: "새로고침", data: `log:r:${k}:${service.id}` }, { label: "Dokploy", url: deployer.dashboardUrl(service) }],
     ]);
   };
@@ -1014,7 +1135,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     if (!service) return ctx.answerCallbackQuery({ text: "서비스를 찾을 수 없어" });
     await ctx.answerCallbackQuery();
     const log = await deployer.buildLog(deploymentId, 300);
-    await say(ctx, [`${bold(service.repo)} 빌드 로그`, log ? logBlock(log) : "<i>로그가 없어</i>"].join("\n"));
+    await say(ctx, logCard(service.repo, "빌드 로그", log, "로그가 없어"));
   });
 
   bot.catch(async (err) => {
