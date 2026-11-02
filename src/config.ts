@@ -12,22 +12,13 @@ export interface AiConfig {
 }
 
 const PRESETS = [
-  { name: "gemini", key: "GEMINI_API_KEY", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash" },
+  { name: "ollama", key: "OLLAMA_API_KEY", baseUrl: "https://ollama.com/v1", model: "gpt-oss:120b" },
   { name: "mistral", key: "MISTRAL_API_KEY", baseUrl: "https://api.mistral.ai/v1", model: "codestral-latest" },
   { name: "openrouter", key: "OPENROUTER_API_KEY", baseUrl: "https://openrouter.ai/api/v1", model: "openrouter/free" },
 ] as const;
 
 function loadAi(env: Env): AiConfig | null {
   const providers: AiProvider[] = [];
-  const customKey = optional(env, "AI_API_KEY");
-  if (customKey) {
-    providers.push({
-      name: "custom",
-      baseUrl: (optional(env, "AI_BASE_URL") ?? "https://api.openai.com/v1").replace(/\/+$/, ""),
-      apiKey: customKey,
-      model: required(env, "AI_MODEL"),
-    });
-  }
   for (const preset of PRESETS) {
     const apiKey = optional(env, preset.key);
     if (!apiKey) continue;
@@ -37,6 +28,15 @@ function loadAi(env: Env): AiConfig | null {
       baseUrl: preset.baseUrl,
       apiKey,
       model: optional(env, `${prefix}_MODEL`) ?? preset.model,
+    });
+  }
+  const customKey = optional(env, "AI_API_KEY");
+  if (customKey) {
+    providers.push({
+      name: "custom",
+      baseUrl: (optional(env, "AI_BASE_URL") ?? "https://api.openai.com/v1").replace(/\/+$/, ""),
+      apiKey: customKey,
+      model: required(env, "AI_MODEL"),
     });
   }
   const order = (optional(env, "AI_PROVIDER_ORDER") ?? "")
