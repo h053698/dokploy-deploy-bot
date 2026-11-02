@@ -5,10 +5,12 @@ import { loadConfig } from "./config.ts";
 import { Deployer } from "./deployer.ts";
 import { Dokploy } from "./dokploy.ts";
 import { GitHub } from "./github.ts";
+import { GitHubAppTokens } from "./github-app.ts";
 
 const cfg = loadConfig();
 const dk = new Dokploy(cfg.dokployUrl, cfg.dokployApiKey);
-const gh = new GitHub(cfg.githubApiUrl, cfg.githubToken);
+const appTokens = new GitHubAppTokens(dk, cfg.githubApiUrl);
+const gh = new GitHub(cfg.githubApiUrl, cfg.githubToken, fetch, (ref) => appTokens.tokenFor(ref));
 const proxy = cfg.telegramProxy;
 const telegram = new Bot(
   cfg.telegramToken,

@@ -50,7 +50,7 @@ Deploying on Dokploy: this repo has a `Dockerfile`, so you can register it as a 
 
 ## Notes
 
-- Private repos: if the Dokploy GitHub App has access, the bot connects through it. Otherwise it clones the public URL. To analyze a private repo you also need `GITHUB_TOKEN`.
+- Private repos: if the repo is inside a Dokploy GitHub App installation, the bot both reads it (it mints a short-lived installation token from the app's credentials in Dokploy) and connects Dokploy to it through the app. No `GITHUB_TOKEN` needed. Repos outside every installation need `GITHUB_TOKEN` to be read, and Dokploy can only clone them if they are public.
 - AI: set any of `OLLAMA_API_KEY` (Ollama Cloud, pay per token), `MISTRAL_API_KEY`, `OPENROUTER_API_KEY`, or a custom OpenAI-compatible `AI_BASE_URL`/`AI_API_KEY`/`AI_MODEL`. Every provider with a key joins a fallback chain (Ollama > Mistral > OpenRouter > custom, or `AI_PROVIDER_ORDER`). If one fails, is rate-limited, times out, or replies without a Dockerfile, the next one is tried, and the progress message names the provider that answered. With no keys, the AI fallback is off.
 - You can edit or delete the generated Dockerfile in the Dokploy service under Patches.
 - For a Dockerfile/Railpack app with no `EXPOSE`, the bot sets the `PORT` env var to the port it assumed (Railpack: Node 3000, Python 8000, Go/Ruby 8080).
