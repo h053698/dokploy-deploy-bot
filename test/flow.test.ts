@@ -270,8 +270,24 @@ interface Btn {
   url?: string;
   copy_text?: { text: string };
   style?: string;
+  disabled?: boolean;
 }
-const buttons = (s: Sent | undefined): Btn[] => ((s?.payload.reply_markup as { inline_keyboard?: Btn[][] })?.inline_keyboard ?? []).flat();
+const unesc = (s: string) => s.replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+const richButtons = (html: string): Btn[] =>
+  [...html.matchAll(/<tg-button ([^>]*)>([^<]*)<\/tg-button>/g)].map((m) => {
+    const attrs = Object.fromEntries([...(m[1] ?? "").matchAll(/([\w-]+)="([^"]*)"/g)].map((a) => [a[1], unesc(a[2] ?? "")]));
+    const btn: Btn = { text: unesc(m[2] ?? "") };
+    if (attrs.type === "callback_data") btn.callback_data = attrs.data;
+    if (attrs.type === "url") btn.url = attrs.url;
+    if (attrs.type === "copy_text") btn.copy_text = { text: attrs.text ?? "" };
+    if (attrs.type === "disabled") btn.disabled = true;
+    if (attrs.style) btn.style = attrs.style;
+    return btn;
+  });
+const buttons = (s: Sent | undefined): Btn[] => {
+  const html = (s?.payload.rich_message as { html?: string } | undefined)?.html;
+  return html ? richButtons(html) : ((s?.payload.reply_markup as { inline_keyboard?: Btn[][] })?.inline_keyboard ?? []).flat();
+};
 const lastWith = (sent: Sent[], pred: (s: Sent) => boolean) => [...sent].reverse().find(pred);
 const bodyOf = (s: Sent | undefined) => String(s?.payload.text ?? (s?.payload.rich_message as { html?: string } | undefined)?.html ?? "");
 const resultCard = (sent: Sent[], needle: string) => lastWith(sent, (s) => s.method === "sendRichMessage" && bodyOf(s).includes(needle));
@@ -296,31 +312,32 @@ describe("telegram flow", () => {
     await bot.handleUpdate(command("/deploy https://github.com/h053698/hello"));
 
     let w = wizard(sent);
-    expect(String(w?.payload.text)).toContain("어떻게 빌드할까?");
-    expect(w?.payload.parse_mode).toBe("HTML");
+    expect(bodyOf(w)).toContain("어떻게 빌드할까?");
+    expect(w?.method).toBe("editMessageText");
+    expect((w?.payload.rich_message as { html?: string } | undefined)?.html).toContain("<tg-button-row>");
     const choices = buttons(w).map((b) => b.text);
-    expect(choices).toEqual(expect.arrayContaining(["⭐ 🚂 Railpack", "🤖 AI가 Dockerfile 생성", "❄️ Nixpacks", "🟣 Heroku Buildpacks", "📦 Paketo Buildpacks", "📄 Static (nginx)"]));
+    expect(choices).toEqual(expect.arrayContaining(["Railpack (추천)", "AI가 Dockerfile 생성", "Nixpacks", "Heroku Buildpacks", "Paketo Buildpacks", "Static (nginx)"]));
     expect(buttons(w).find((b) => b.text.includes("Railpack"))?.style).toBe("primary");
     expect(dk.paths()).not.toContain("application.create");
 
     await bot.handleUpdate(railpack(sent));
     w = wizard(sent);
-    expect(String(w?.payload.text)).toContain("어느 Dokploy 프로젝트에 올릴까?");
-    expect(buttons(w)[0]).toMatchObject({ text: "✨ 새로 만들기: hello", style: "primary" });
-    expect(buttons(w).map((b) => b.text)).toContain("📁 solix-web");
+    expect(bodyOf(w)).toContain("어느 Dokploy 프로젝트에 올릴까?");
+    expect(buttons(w)[0]).toMatchObject({ text: "새 프로젝트: hello (추천)", style: "primary" });
+    expect(buttons(w).map((b) => b.text)).toContain("solix-web");
 
-    await bot.handleUpdate(press(w, "✨ 새로 만들기: hello"));
+    await bot.handleUpdate(press(w, "새 프로젝트: hello (추천)"));
     w = wizard(sent);
-    expect(String(w?.payload.text)).toContain("도메인은 어떻게 할까?");
-    await bot.handleUpdate(press(w, "🌐 hello.arpa.page"));
+    expect(bodyOf(w)).toContain("도메인은 어떻게 할까?");
+    await bot.handleUpdate(press(w, "hello.arpa.page (추천)"));
     w = wizard(sent);
-    expect(String(w?.payload.text)).toContain("이대로 올릴까?");
-    expect(String(w?.payload.text)).toContain("프로젝트 <b>hello</b> <i>(새로 만듦)</i>");
-    expect(String(w?.payload.text)).toContain("환경 <b>production</b>");
-    expect(String(w?.payload.text)).toContain("<code>https://hello.arpa.page</code>");
-    expect(buttons(w)[0]).toMatchObject({ text: "🚀 배포하기", style: "success" });
+    expect(bodyOf(w)).toContain("이대로 올릴까?");
+    expect(bodyOf(w)).toContain("프로젝트 <b>hello</b> <i>(새로 만듦)</i>");
+    expect(bodyOf(w)).toContain("환경 <b>production</b>");
+    expect(bodyOf(w)).toContain("<code>https://hello.arpa.page</code>");
+    expect(buttons(w)[0]).toMatchObject({ text: "배포하기", style: "success" });
 
-    await bot.handleUpdate(press(w, "🚀 배포하기"));
+    await bot.handleUpdate(press(w, "배포하기"));
     await idle();
 
     const mutations = dk.paths().filter((p) => !["project.all", "deployment.all", "github.githubProviders", "deployment.readLogs", "application.search", "compose.search"].includes(p));
@@ -349,23 +366,23 @@ describe("telegram flow", () => {
     expect(bodyOf(card)).toContain("<table");
     expect(card?.payload.message_effect_id).toBeDefined();
     const kb = buttons(card);
-    expect(kb.find((b) => b.text === "🌐 열기")).toMatchObject({ url: "https://hello.arpa.page", style: "success" });
-    expect(kb.find((b) => b.text === "📋 URL 복사")?.copy_text).toEqual({ text: "https://hello.arpa.page" });
-    expect(kb.find((b) => b.text === "🧭 Dokploy")?.url).toContain(`/dashboard/project/${created?.projectId}/environment/`);
+    expect(kb.find((b) => b.text === "사이트 열기")).toMatchObject({ url: "https://hello.arpa.page", style: "success" });
+    expect(kb.find((b) => b.text === "URL 복사")?.copy_text).toEqual({ text: "https://hello.arpa.page" });
+    expect(kb.find((b) => b.text === "Dokploy")?.url).toContain(`/dashboard/project/${created?.projectId}/environment/`);
     expect(kb.some((b) => b.callback_data?.startsWith("log:b:a:"))).toBe(true);
     expect(sent.some((s) => s.method === "deleteMessage")).toBe(true);
-    const frozen = lastWith(sent, (s) => s.method === "editMessageReplyMarkup");
-    expect(buttons(frozen).map((b) => b.text)).toEqual(["✅ 배포 완료"]);
+    const frozen = lastWith(sent, (s) => s.method === "editMessageText" && buttons(s).some((b) => b.disabled));
+    expect(buttons(frozen)).toEqual([{ text: "배포 완료", disabled: true }]);
   });
 
   test("choosing AI Dockerfile generates it before the first build and skips the failing railpack run", async () => {
     const { bot, dk, sent, idle } = await setup();
     await bot.handleUpdate(command("/deploy h053698/hello"));
-    await bot.handleUpdate(press(wizard(sent), "🤖 AI가 Dockerfile 생성"));
-    await bot.handleUpdate(press(wizard(sent), "✨ 새로 만들기: hello"));
-    await bot.handleUpdate(press(wizard(sent), "🚫 도메인 없이"));
-    expect(String(wizard(sent)?.payload.text)).toContain("AI가 Dockerfile을 만들어서 빌드");
-    await bot.handleUpdate(press(wizard(sent), "🚀 배포하기"));
+    await bot.handleUpdate(press(wizard(sent), "AI가 Dockerfile 생성"));
+    await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)"));
+    await bot.handleUpdate(press(wizard(sent), "도메인 없이"));
+    expect(bodyOf(wizard(sent))).toContain("AI가 Dockerfile을 만들어서 빌드");
+    await bot.handleUpdate(press(wizard(sent), "배포하기"));
     await idle();
     const mutations = dk.paths().filter((p) => !["project.all", "deployment.all", "github.githubProviders", "application.search", "compose.search"].includes(p));
     expect(mutations).toEqual(["project.create", "application.create", "application.saveGitProvider", "patch.create", "application.saveBuildType", "application.saveEnvironment", "application.deploy"]);
@@ -392,10 +409,10 @@ describe("telegram flow", () => {
   test("static choice uses the static builder on port 80 without a PORT env", async () => {
     const { bot, dk, sent, idle } = await setup();
     await bot.handleUpdate(command("/deploy h053698/hello"));
-    await bot.handleUpdate(press(wizard(sent), "📄 Static (nginx)"));
-    await bot.handleUpdate(press(wizard(sent), "✨ 새로 만들기: hello"));
-    await bot.handleUpdate(press(wizard(sent), "🌐 hello.arpa.page"));
-    await bot.handleUpdate(press(wizard(sent), "🚀 배포하기"));
+    await bot.handleUpdate(press(wizard(sent), "Static (nginx)"));
+    await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)"));
+    await bot.handleUpdate(press(wizard(sent), "hello.arpa.page (추천)"));
+    await bot.handleUpdate(press(wizard(sent), "배포하기"));
     await idle();
     expect(dk.calls.find((c) => c.path === "application.saveBuildType")?.body).toMatchObject({ buildType: "static", isStaticSpa: true });
     expect(dk.paths()).not.toContain("application.saveEnvironment");
@@ -407,9 +424,9 @@ describe("telegram flow", () => {
     dk.addProject("solix-web", ["production", "dev"]);
     await bot.handleUpdate(command("/deploy h053698/hello"));
     await bot.handleUpdate(railpack(sent));
-    await bot.handleUpdate(press(wizard(sent), "📁 solix-web"));
-    await bot.handleUpdate(press(wizard(sent), "🌱 dev"));
-    expect(buttons(wizard(sent)).map((b) => b.text)).toContain("🌐 hello-dev.arpa.page");
+    await bot.handleUpdate(press(wizard(sent), "solix-web"));
+    await bot.handleUpdate(press(wizard(sent), "dev"));
+    expect(buttons(wizard(sent)).map((b) => b.text)).toContain("hello-dev.arpa.page (추천)");
   });
 
   test("existing project + new environment via button creates the environment there", async () => {
@@ -417,16 +434,16 @@ describe("telegram flow", () => {
     const project = dk.addProject("solix-web", ["production"]);
     await bot.handleUpdate(command("/deploy h053698/hello"));
     await bot.handleUpdate(railpack(sent));
-    await bot.handleUpdate(press(wizard(sent), "📁 solix-web"));
+    await bot.handleUpdate(press(wizard(sent), "solix-web"));
     let w = wizard(sent);
-    expect(String(w?.payload.text)).toContain("어느 환경(environment)에 올릴까?");
-    expect(buttons(w).find((b) => b.text === "🌱 production (기본)")?.style).toBe("primary");
+    expect(bodyOf(w)).toContain("어느 환경(environment)에 올릴까?");
+    expect(buttons(w).find((b) => b.text === "production (기본)")?.style).toBe("primary");
     await bot.handleUpdate(press(w, "＋ staging"));
-    await bot.handleUpdate(press(wizard(sent), "🚫 도메인 없이"));
+    await bot.handleUpdate(press(wizard(sent), "도메인 없이"));
     w = wizard(sent);
-    expect(String(w?.payload.text)).toContain("환경 <b>staging</b> <i>(새로 만듦)</i>");
-    expect(String(w?.payload.text)).toContain("도메인 없음");
-    await bot.handleUpdate(press(w, "🚀 배포하기"));
+    expect(bodyOf(w)).toContain("환경 <b>staging</b> <i>(새로 만듦)</i>");
+    expect(bodyOf(w)).toContain("도메인 없음");
+    await bot.handleUpdate(press(w, "배포하기"));
     await idle();
     expect(dk.calls.find((c) => c.path === "environment.create")?.body).toMatchObject({ name: "staging", projectId: project.projectId });
     const staging = project.envs.find((e) => e.name === "staging");
@@ -440,19 +457,19 @@ describe("telegram flow", () => {
     const project = dk.addProject("team-apps", ["production", "dev"]);
     await bot.handleUpdate(command("/deploy h053698/hello"));
     await bot.handleUpdate(railpack(sent));
-    await bot.handleUpdate(press(wizard(sent), "✏️ 이름 직접 입력"));
-    const prompt = lastWith(sent, (s) => s.method === "sendMessage" && String(s.payload.text).startsWith("✏️"));
+    await bot.handleUpdate(press(wizard(sent), "이름 직접 입력"));
+    const prompt = lastWith(sent, (s) => s.method === "sendMessage" && Boolean((s.payload.reply_markup as { force_reply?: boolean } | undefined)?.force_reply));
     expect(prompt?.payload.reply_markup).toMatchObject({ force_reply: true, inline_keyboard: [[{ text: "취소" }]] });
     await bot.handleUpdate(reply("Bad Name!!"));
     expect(String(lastWith(sent, (s) => s.method === "sendMessage")?.payload.text)).toContain("영문 소문자");
     await bot.handleUpdate(reply("Team-Apps"));
     expect(sent.some((s) => s.method === "deleteMessage")).toBe(true);
-    await bot.handleUpdate(press(wizard(sent), "✏️ 직접 입력"));
+    await bot.handleUpdate(press(wizard(sent), "직접 입력"));
     await bot.handleUpdate(reply("dev"));
-    await bot.handleUpdate(press(wizard(sent), "✏️ 직접 입력"));
+    await bot.handleUpdate(press(wizard(sent), "직접 입력"));
     await bot.handleUpdate(reply("my-api"));
     expect(sent.some((s) => s.method === "setMessageReaction")).toBe(true);
-    await bot.handleUpdate(press(wizard(sent), "🚀 배포하기"));
+    await bot.handleUpdate(press(wizard(sent), "배포하기"));
     await idle();
     expect(dk.paths()).not.toContain("project.create");
     expect(dk.paths()).not.toContain("environment.create");
@@ -464,8 +481,8 @@ describe("telegram flow", () => {
     const { bot, sent } = await setup();
     await bot.handleUpdate(command("/deploy h053698/hello", STRANGER_ID, group(GROUP_ID)));
     await bot.handleUpdate(press(wizard(sent), /Railpack/, STRANGER_ID, group(GROUP_ID)));
-    await bot.handleUpdate(press(wizard(sent), "✏️ 이름 직접 입력", STRANGER_ID, group(GROUP_ID)));
-    const prompt = lastWith(sent, (s) => s.method === "sendMessage" && String(s.payload.text).startsWith("✏️"));
+    await bot.handleUpdate(press(wizard(sent), "이름 직접 입력", STRANGER_ID, group(GROUP_ID)));
+    const prompt = lastWith(sent, (s) => s.method === "sendMessage" && Boolean((s.payload.reply_markup as { force_reply?: boolean } | undefined)?.force_reply));
     expect(prompt?.payload.reply_markup).toMatchObject({ force_reply: true, selective: true });
     expect(String(prompt?.payload.text)).toContain(`tg://user?id=${STRANGER_ID}`);
   });
@@ -493,7 +510,7 @@ describe("telegram flow", () => {
     await bot.handleUpdate(command("/update hel"));
     const picker = lastWith(sent, (s) => buttons(s).length > 0);
     expect(picker?.payload.text).toBe("어떤 서비스를 업데이트할까?");
-    expect(buttons(picker).map((b) => b.text)).toEqual(["🟢 h053698/hello · production", "🟢 h053698/hello-api · staging"]);
+    expect(buttons(picker).map((b) => b.text)).toEqual(["h053698/hello · production", "h053698/hello-api · staging"]);
 
     await bot.handleUpdate(click(buttons(picker)[1]?.callback_data ?? ""));
     await idle();
@@ -525,7 +542,7 @@ describe("telegram flow", () => {
     expect(bodyOf(final)).toContain("&lt;script&gt;");
     expect(bodyOf(final)).not.toContain("sha256:");
     expect(final?.payload.message_effect_id).toBeUndefined();
-    const logBtn = buttons(final).find((b) => b.text === "📜 빌드 로그");
+    const logBtn = buttons(final).find((b) => b.text === "빌드 로그");
     await bot.handleUpdate(click(logBtn?.callback_data ?? ""));
     expect(String(lastWith(sent, (s) => s.method === "sendMessage")?.payload.text)).toContain("빌드 로그");
   });
@@ -538,7 +555,7 @@ describe("telegram flow", () => {
     const msg = lastWith(sent, (s) => s.method === "sendMessage");
     expect(String(msg?.payload.text)).toContain("listening on :3000");
     expect(String(msg?.payload.text)).not.toContain("sha256:");
-    expect(buttons(msg).map((b) => b.text)).toEqual(["🔄 새로고침", "🧭 Dokploy"]);
+    expect(buttons(msg).map((b) => b.text)).toEqual(["새로고침", "Dokploy"]);
   });
 
   test("/deploy of an already managed repo still starts the wizard and offers update shortcuts", async () => {
@@ -558,9 +575,9 @@ describe("telegram flow", () => {
     await bot.handleUpdate(command("/deploy h053698/hello", OWNER_ID, inGroup, true));
     let w = wizard(sent);
     await bot.handleUpdate(press(w, /Railpack/, OWNER_ID, inGroup, true));
-    await bot.handleUpdate(press(wizard(sent), "✨ 새로 만들기: hello", OWNER_ID, inGroup, true));
-    await bot.handleUpdate(press(wizard(sent), "🚫 도메인 없이", OWNER_ID, inGroup, true));
-    await bot.handleUpdate(press(wizard(sent), "🚀 배포하기", OWNER_ID, inGroup, true));
+    await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)", OWNER_ID, inGroup, true));
+    await bot.handleUpdate(press(wizard(sent), "도메인 없이", OWNER_ID, inGroup, true));
+    await bot.handleUpdate(press(wizard(sent), "배포하기", OWNER_ID, inGroup, true));
     await idle();
     const outgoing = sent.filter((s) => ["sendMessage", "sendRichMessage"].includes(s.method) && s.payload.chat_id === GROUP_ID);
     expect(outgoing.length).toBeGreaterThanOrEqual(3);
@@ -573,9 +590,9 @@ describe("telegram flow", () => {
     const inGroup = group(GROUP_ID);
     await bot.handleUpdate(command("/deploy h053698/hello", OWNER_ID, inGroup));
     await bot.handleUpdate(press(wizard(sent), /Railpack/, OWNER_ID, inGroup));
-    await bot.handleUpdate(press(wizard(sent), "✨ 새로 만들기: hello", OWNER_ID, inGroup));
-    await bot.handleUpdate(press(wizard(sent), "🚫 도메인 없이", OWNER_ID, inGroup));
-    await bot.handleUpdate(press(wizard(sent), "🚀 배포하기", OWNER_ID, inGroup));
+    await bot.handleUpdate(press(wizard(sent), "새 프로젝트: hello (추천)", OWNER_ID, inGroup));
+    await bot.handleUpdate(press(wizard(sent), "도메인 없이", OWNER_ID, inGroup));
+    await bot.handleUpdate(press(wizard(sent), "배포하기", OWNER_ID, inGroup));
     await idle();
     const outgoing = sent.filter((s) => ["sendMessage", "sendRichMessage"].includes(s.method) && s.payload.chat_id === GROUP_ID);
     expect(outgoing.length).toBeGreaterThanOrEqual(3);
@@ -585,7 +602,7 @@ describe("telegram flow", () => {
   test("any member of an allowed group can use the bot there", async () => {
     const { bot, dk, sent } = await setup();
     await bot.handleUpdate(command("/deploy@deploy_bot https://github.com/h053698/hello", STRANGER_ID, group(GROUP_ID)));
-    expect(String(wizard(sent)?.payload.text)).toContain("어떻게 빌드할까?");
+    expect(bodyOf(wizard(sent))).toContain("어떻게 빌드할까?");
     expect(dk.paths()).toContain("project.all");
   });
 
@@ -656,7 +673,7 @@ describe("telegram flow", () => {
     await bot.handleUpdate(command("/deploy x/y", STRANGER_ID));
     const requests = sent.filter((s) => s.method === "sendMessage" && s.payload.chat_id === ADMIN_ID);
     expect(requests).toHaveLength(1);
-    const approve = buttons(requests[0]).find((b) => b.text === "✅ 허용");
+    const approve = buttons(requests[0]).find((b) => b.text === "허용");
     expect(approve).toMatchObject({ callback_data: `acl:add:${STRANGER_ID}`, style: "success" });
 
     await bot.handleUpdate(click(approve?.callback_data ?? "", OWNER_ID));

@@ -22,14 +22,14 @@ export type BuildPlan =
 export type BuildChoice = "compose" | "dockerfile" | "ai_dockerfile" | "railpack" | "nixpacks" | "heroku_buildpacks" | "paketo_buildpacks" | "static";
 
 export const BUILD_LABELS: Record<BuildChoice, string> = {
-  compose: "🐳 Docker Compose",
-  dockerfile: "🐳 Dockerfile",
-  ai_dockerfile: "🤖 AI가 Dockerfile 생성",
-  railpack: "🚂 Railpack",
-  nixpacks: "❄️ Nixpacks",
-  heroku_buildpacks: "🟣 Heroku Buildpacks",
-  paketo_buildpacks: "📦 Paketo Buildpacks",
-  static: "📄 Static (nginx)",
+  compose: "Docker Compose",
+  dockerfile: "Dockerfile",
+  ai_dockerfile: "AI가 Dockerfile 생성",
+  railpack: "Railpack",
+  nixpacks: "Nixpacks",
+  heroku_buildpacks: "Heroku Buildpacks",
+  paketo_buildpacks: "Paketo Buildpacks",
+  static: "Static (nginx)",
 };
 
 export interface BuildOptions {

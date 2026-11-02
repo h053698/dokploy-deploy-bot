@@ -5,6 +5,15 @@ import { type Config, publicUrl } from "./config.ts";
 import type { Deployer, DeployResult, ManagedService, ProjectInfo, Reporter, RunOutcome, Target } from "./deployer.ts";
 import { type GitHub, parseRepoUrl, type RepoInfo, repoKey } from "./github.ts";
 
+interface RichButton {
+  label: string;
+  data?: string;
+  url?: string;
+  copy?: string;
+  style?: "primary" | "success" | "danger";
+  disabled?: boolean;
+}
+
 type Step = "build" | "project" | "env" | "domain" | "confirm";
 type Awaiting = "project" | "env" | "domain" | null;
 
@@ -72,6 +81,44 @@ export function logBlock(log: string, max = LOG_BLOCK_CHARS): string {
   return `<blockquote expandable>${esc(clipTail(cleanLog(log) || log.trim(), max))}</blockquote>`;
 }
 
+const attr = (s: string) => esc(s).replace(/"/g, "&quot;");
+
+function richButton(b: RichButton): string {
+  const style = b.style ? ` style="${b.style}"` : "";
+  const label = esc(b.label);
+  if (b.disabled) return `<tg-button type="disabled"${style}>${label}</tg-button>`;
+  if (b.url) return `<tg-button type="url" url="${attr(b.url)}"${style}>${label}</tg-button>`;
+  if (b.copy) return `<tg-button type="copy_text" text="${attr(b.copy)}"${style}>${label}</tg-button>`;
+  return `<tg-button type="callback_data" data="${attr(b.data ?? "")}"${style}>${label}</tg-button>`;
+}
+
+const richRows = (rows: RichButton[][]) => rows.filter((r) => r.length).map((r) => `<tg-button-row>${r.map(richButton).join("")}</tg-button-row>`).join("");
+
+const richParagraphs = (html: string) =>
+  html
+    .split("\n\n")
+    .filter((p) => p.trim())
+    .map((p) => `<p>${p.trim().replace(/\n/g, "<br>")}</p>`)
+    .join("");
+
+function toInline(rows: RichButton[][]): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  for (const row of rows) {
+    if (!row.length) continue;
+    for (const b of row) {
+      if (b.disabled) kb.disabled(b.label);
+      else if (b.url) kb.url(b.label, b.url);
+      else if (b.copy) kb.copyText(b.label, b.copy);
+      else kb.text(b.label, b.data ?? "");
+      if (b.style === "primary") kb.primary();
+      else if (b.style === "success") kb.success();
+      else if (b.style === "danger") kb.danger();
+    }
+    kb.row();
+  }
+  return kb;
+}
+
 const richLog = (log: string) => `<blockquote expandable>${esc(clipTail(cleanLog(log) || log.trim(), RICH_LOG_CHARS)).replace(/\n/g, "<br>")}</blockquote>`;
 
 export function whereOf(ctx: Context): Place {
@@ -112,7 +159,7 @@ function describePlan(plan: BuildPlan, railpackVersion: string): string {
   if (plan.kind === "compose") {
     return `Docker Compose ${code(plan.composePath)} · 도메인 → ${bold(plan.serviceName)} (전체 ${plan.services.length}개)`;
   }
-  if (plan.generateDockerfile) return "🤖 AI가 Dockerfile을 만들어서 빌드";
+  if (plan.generateDockerfile) return "AI가 Dockerfile을 만들어서 빌드";
   if (plan.buildType === "dockerfile") return `Dockerfile ${code(plan.dockerfile ?? "Dockerfile")}`;
   if (plan.buildType === "railpack") return `Railpack v${esc(railpackVersion)} <i>(실패하면 AI가 Dockerfile 생성)</i>`;
   if (plan.buildType === "static") return "Static (nginx) <i>저장소 그대로 서빙</i>";
@@ -139,24 +186,24 @@ const defaultDomain = (w: Wizard, baseDomain: string) => {
 };
 
 export function wizardText(w: Wizard, cfg: Pick<Config, "domainTls" | "railpackVersion">): string {
-  const lines = [`📦 ${bold(`${w.repo.owner}/${w.repo.repo}`)} · ${code(w.repo.defaultBranch)}`, "", stepBar(w.step), ""];
-  if (w.step !== "build") lines.push(`🔧 빌드 ${describePlan(w.plan, cfg.railpackVersion)} · 포트 ${w.plan.port}`);
-  if (w.target) lines.push(`📁 프로젝트 ${bold(w.target.projectName)}${w.target.projectId ? "" : " <i>(새로 만듦)</i>"}`);
+  const lines = [`${bold(`${w.repo.owner}/${w.repo.repo}`)} · ${code(w.repo.defaultBranch)}`, "", stepBar(w.step), ""];
+  if (w.step !== "build") lines.push(`빌드 ${describePlan(w.plan, cfg.railpackVersion)} · 포트 ${w.plan.port}`);
+  if (w.target) lines.push(`프로젝트 ${bold(w.target.projectName)}${w.target.projectId ? "" : " <i>(새로 만듦)</i>"}`);
   if (w.target && w.step !== "env" && w.step !== "project") {
-    lines.push(`🌱 환경 ${bold(w.target.environmentName)}${w.target.environmentId ? "" : " <i>(새로 만듦)</i>"}`);
+    lines.push(`환경 ${bold(w.target.environmentName)}${w.target.environmentId ? "" : " <i>(새로 만듦)</i>"}`);
   }
   if (w.domain !== undefined) {
-    lines.push(`🌐 도메인 ${w.domain ? code(publicUrl(cfg, w.domain)) : "없음"}`);
+    lines.push(`도메인 ${w.domain ? code(publicUrl(cfg, w.domain)) : "없음"}`);
   }
-  for (const warning of w.plan.warnings) lines.push(`⚠️ ${esc(warning)}`);
-  if (w.domain && w.dnsOk === false) lines.push(`⚠️ ${code(w.domain)} DNS가 아직 안 잡혀 있어. 서버 IP로 A 레코드를 걸어야 접속돼`);
+  for (const warning of w.plan.warnings) lines.push(`${esc(warning)}`);
+  if (w.domain && w.dnsOk === false) lines.push(`${code(w.domain)} DNS가 아직 안 잡혀 있어. 서버 IP로 A 레코드를 걸어야 접속돼`);
   if (w.step === "build") {
     lines.push(`감지: ${describePlan(w.options.detected, cfg.railpackVersion)}`);
-    lines.push("어떻게 빌드할까? <i>(⭐ 추천)</i>");
+    lines.push("어떻게 빌드할까?");
   }
-  if (w.step === "project") lines.push("", w.awaiting === "project" ? "✏️ 새 프로젝트 이름을 답장으로 보내줘" : "어느 Dokploy 프로젝트에 올릴까?");
-  if (w.step === "env") lines.push("", w.awaiting === "env" ? "✏️ 새 환경 이름을 답장으로 보내줘" : "어느 환경(environment)에 올릴까?");
-  if (w.step === "domain") lines.push("", w.awaiting === "domain" ? "✏️ 도메인을 답장으로 보내줘" : "도메인은 어떻게 할까?");
+  if (w.step === "project") lines.push("", w.awaiting === "project" ? "새 프로젝트 이름을 답장으로 보내줘" : "어느 Dokploy 프로젝트에 올릴까?");
+  if (w.step === "env") lines.push("", w.awaiting === "env" ? "새 환경 이름을 답장으로 보내줘" : "어느 환경(environment)에 올릴까?");
+  if (w.step === "domain") lines.push("", w.awaiting === "domain" ? "도메인을 답장으로 보내줘" : "도메인은 어떻게 할까?");
   if (w.step === "confirm") lines.push("", "이대로 올릴까?");
   return lines.join("\n");
 }
@@ -167,13 +214,13 @@ function resultText(result: FullResult, cfg: Pick<Config, "domainTls">): string 
   void cfg;
   const where = `${result.service.projectName} / ${result.service.environmentName}`;
   if (result.status === "done") {
-    const lines = [`✅ ${bold(result.service.repo)} 배포 완료`, `📁 ${esc(where)} · ${code(result.service.appName)}`];
-    if (result.url) lines.push(`🌐 ${esc(result.url)}`);
-    if (result.usedAiDockerfile) lines.push("🤖 AI가 만든 <code>Dockerfile.deploy-bot</code>으로 빌드했어 (Dokploy Patches에서 수정 가능)");
+    const lines = [`${bold(result.service.repo)} 배포 완료`, `${esc(where)} · ${code(result.service.appName)}`];
+    if (result.url) lines.push(`${esc(result.url)}`);
+    if (result.usedAiDockerfile) lines.push("AI가 만든 <code>Dockerfile.deploy-bot</code>으로 빌드했어 (Dokploy Patches에서 수정 가능)");
     return lines.join("\n");
   }
   const reason = result.status === "timeout" ? "시간 초과 (Dokploy에서 계속 진행 중일 수 있음)" : result.status;
-  const lines = [`❌ ${bold(result.service.repo)} 배포 실패 · ${esc(reason)}`, `📁 ${esc(where)}`];
+  const lines = [`${bold(result.service.repo)} 배포 실패 · ${esc(reason)}`, `${esc(where)}`];
   if (result.logTail) lines.push("", "빌드 로그 끝부분", logBlock(result.logTail));
   return lines.join("\n");
 }
@@ -188,25 +235,27 @@ function resultRich(result: FullResult): string {
   if (result.buildLabel) rows.push(["빌드", result.buildLabel]);
   if (result.url) rows.push(["주소", result.url]);
   const table = `<table bordered striped compact>${rows.map(([k, v]) => `<tr><td><b>${esc(k)}</b></td><td>${esc(v)}</td></tr>`).join("")}</table>`;
-  const parts = [`<h3>${ok ? "✅" : "❌"} ${esc(result.service.repo)} ${ok ? "배포 완료" : `배포 실패 · ${esc(reason)}`}</h3>`, table];
-  if (ok && result.usedAiDockerfile) parts.push("<p>🤖 AI가 만든 <code>Dockerfile.deploy-bot</code>으로 빌드했어. Dokploy Patches에서 고칠 수 있어.</p>");
+  const parts = [`<h3>${esc(result.service.repo)} ${ok ? "배포 완료" : `배포 실패 · ${esc(reason)}`}</h3>`, table];
+  if (ok && result.usedAiDockerfile) parts.push("<p>AI가 만든 <code>Dockerfile.deploy-bot</code>으로 빌드했어. Dokploy Patches에서 고칠 수 있어.</p>");
   if (!ok && result.logTail) parts.push("<p>빌드 로그 끝부분</p>", richLog(result.logTail));
   return parts.join("");
 }
 
-function resultKeyboard(result: FullResult): InlineKeyboard {
+function resultButtons(result: FullResult): RichButton[][] {
   const k = result.service.kind === "application" ? "a" : "c";
-  const kb = new InlineKeyboard();
-  if (result.status === "done" && result.url) kb.url("🌐 열기", result.url).style("success");
-  kb.url("🧭 Dokploy", result.dashboard);
-  if (result.url) kb.copyText("📋 URL 복사", result.url);
-  kb.row();
-  if (result.deploymentId) kb.text("📜 빌드 로그", `log:b:${k}:${result.service.id}:${result.deploymentId}`);
-  kb.text("🖥 실행 로그", `log:r:${k}:${result.service.id}`);
-  kb.row();
-  kb.text("⬇️ 업데이트", `run:u:${k}:${result.service.id}`).text("🔁 다시 빌드", `run:r:${k}:${result.service.id}`);
-  if (result.status !== "done") kb.style("danger");
-  return kb;
+  const ok = result.status === "done";
+  const top: RichButton[] = [];
+  if (ok && result.url) top.push({ label: "사이트 열기", url: result.url, style: "success" });
+  top.push({ label: "Dokploy", url: result.dashboard });
+  if (result.url) top.push({ label: "URL 복사", copy: result.url });
+  const logs: RichButton[] = [];
+  if (result.deploymentId) logs.push({ label: "빌드 로그", data: `log:b:${k}:${result.service.id}:${result.deploymentId}` });
+  logs.push({ label: "실행 로그", data: `log:r:${k}:${result.service.id}` });
+  const runs: RichButton[] = [
+    { label: "업데이트", data: `run:u:${k}:${result.service.id}` },
+    { label: "다시 빌드", data: `run:r:${k}:${result.service.id}`, style: ok ? undefined : "primary" },
+  ];
+  return [top, logs, runs];
 }
 
 class LiveStatus implements Reporter {
@@ -230,7 +279,7 @@ class LiveStatus implements Reporter {
   private render() {
     const sec = Math.max(0, Math.round((this.now() - this.startedAt) / 1000));
     const elapsed = sec >= 60 ? `${Math.floor(sec / 60)}분 ${sec % 60}초` : `${sec}초`;
-    const body = [`${this.header} · ⏱ ${elapsed}`, ...this.steps.map((s, i) => (i === this.steps.length - 1 ? `⏳ ${esc(s)}` : `✓ ${esc(s)}`))];
+    const body = [`${this.header} · ${elapsed}`, ...this.steps.map((s, i) => (i === this.steps.length - 1 ? `▸ ${esc(s)}` : `✓ ${esc(s)}`))];
     if (this.logTail) body.push("", logBlock(this.logTail, 1200));
     return body.join("\n").slice(0, MAX_MESSAGE);
   }
@@ -238,7 +287,7 @@ class LiveStatus implements Reporter {
   private flush(force: boolean) {
     const text = this.render();
     if (!force && this.messageId !== null && this.now() - this.lastEdit < LIVE_EDIT_MS) return this.chain.then(() => undefined);
-    const body = text.replace(/ · ⏱ [^\n]*/, "");
+    const body = text.replace(/ · \d+분? ?\d*초?[^\n]*/, "");
     if (body === this.lastText) return this.chain.then(() => undefined);
     this.lastText = body;
     this.lastEdit = this.now();
@@ -291,19 +340,12 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     return ctx.reply(text, HTML);
   };
 
-  const sendRich = async (
-    api: Context["api"],
-    place: Place,
-    html: string,
-    fallback: string,
-    reply_markup: InlineKeyboard,
-    effect: string | null = null,
-  ) => {
+  const sendRich = async (api: Context["api"], place: Place, html: string, fallback: string, rows: RichButton[][], effect: string | null = null) => {
     try {
-      await api.sendRichMessage(place.chatId, { html }, { ...threadOf(place), reply_markup, ...(effect ? { message_effect_id: effect } : {}) });
+      await api.sendRichMessage(place.chatId, { html: html + richRows(rows) }, { ...threadOf(place), ...(effect ? { message_effect_id: effect } : {}) });
     } catch (error) {
       console.warn("[deploy-bot] rich message failed, falling back to HTML:", error instanceof Error ? error.message : error);
-      await api.sendMessage(place.chatId, fallback.slice(0, MAX_MESSAGE), { ...HTML, ...threadOf(place), reply_markup });
+      await api.sendMessage(place.chatId, fallback.slice(0, MAX_MESSAGE), { ...HTML, ...threadOf(place), reply_markup: toInline(rows) });
     }
   };
 
@@ -312,10 +354,10 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     notifiedRequests.add(userId);
     const u = ctx.from;
     const who = [u?.first_name, u?.last_name].filter(Boolean).join(" ") + (u?.username ? ` (@${u.username})` : "");
-    const keyboard = new InlineKeyboard().text("✅ 허용", `acl:add:${userId}`).success().text("무시", `acl:ignore:${userId}`);
+    const keyboard = new InlineKeyboard().text("허용", `acl:add:${userId}`).success().text("무시", `acl:ignore:${userId}`);
     for (const admin of access.list().admins) {
       await ctx.api
-        .sendMessage(admin, `🔐 접근 요청: ${esc(who || "이름 없음")} · ID ${code(String(userId))}`, { ...HTML, reply_markup: keyboard })
+        .sendMessage(admin, `접근 요청: ${esc(who || "이름 없음")} · ID ${code(String(userId))}`, { ...HTML, reply_markup: keyboard })
         .catch((error: unknown) => console.warn(`[deploy-bot] could not notify admin ${admin}:`, error instanceof Error ? error.message : error));
     }
   };
@@ -330,7 +372,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
       .catch(async (error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         console.error("[deploy-bot]", error);
-        await ctx.reply(`❌ 오류: ${esc(message).slice(0, MAX_MESSAGE)}`, HTML).catch(() => undefined);
+        await ctx.reply(`오류: ${esc(message).slice(0, MAX_MESSAGE)}`, HTML).catch(() => undefined);
       })
       .finally(() => jobs.delete(job));
     jobs.add(job);
@@ -349,10 +391,10 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     if (ctx.callbackQuery) {
       await ctx.answerCallbackQuery({ text: "권한 없음" });
     } else if (isCommand && ctx.chat?.type === "private") {
-      await ctx.reply(`⛔ 권한이 없어. 관리자에게 접근 요청을 보냈어. 내 ID: ${id ?? "unknown"}`);
+      await ctx.reply(`권한이 없어. 관리자에게 접근 요청을 보냈어. 내 ID: ${id ?? "unknown"}`);
       if (id !== undefined) await notifyAdmins(ctx, id);
     } else if (isCommand && ctx.chat) {
-      await ctx.reply(`⛔ 이 그룹에서는 쓸 수 없어. 그룹 ID: ${ctx.chat.id}`);
+      await ctx.reply(`이 그룹에서는 쓸 수 없어. 그룹 ID: ${ctx.chat.id}`);
     }
   });
 
@@ -360,7 +402,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     notice(
       ctx,
       [
-        "🚀 <b>Dokploy 배포 봇</b>",
+        "<b>Dokploy 배포 봇</b>",
         "",
         "/deploy <code>&lt;github url&gt;</code> 새로 배포 (빌드·프로젝트·환경·도메인 골라서)",
         "/update <code>[레포]</code> GitHub 최신 코드로 다시 배포",
@@ -370,7 +412,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
         "",
         "<i>레포 이름은 일부만 쳐도 되고, 비워두면 버튼으로 골라.</i>",
         ...(access.isAdmin(ctx.from?.id)
-          ? ["", "👑 <b>관리자</b>", "/allow <code>&lt;유저ID&gt;</code> DM 허용 (그룹에서 답장으로 /allow 도 됨)", "/disallow <code>&lt;유저ID&gt;</code> 허용 취소", "/allowed 허용 목록"]
+          ? ["", "<b>관리자</b>", "/allow <code>&lt;유저ID&gt;</code> DM 허용 (그룹에서 답장으로 /allow 도 됨)", "/disallow <code>&lt;유저ID&gt;</code> 허용 취소", "/allowed 허용 목록"]
           : []),
       ].join("\n"),
     ),
@@ -378,7 +420,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
 
   const adminOnly = async (ctx: Context) => {
     if (access.isAdmin(ctx.from?.id)) return true;
-    await notice(ctx, "⛔ 관리자만 쓸 수 있어");
+    await notice(ctx, "관리자만 쓸 수 있어");
     return false;
   };
 
@@ -393,7 +435,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     if (target === null) return notice(ctx, "사용법: /allow &lt;유저ID&gt; 또는 그 사람 메시지에 답장으로 /allow");
     const result = await access.add(target);
     console.log(`[deploy-bot] allow user=${target} by=${ctx.from?.id} result=${result}`);
-    return notice(ctx, result === "added" ? `✅ ${target} 허용했어. 이제 DM으로 봇을 쓸 수 있어` : `${target}는 이미 허용돼 있어`);
+    return notice(ctx, result === "added" ? `${target} 허용했어. 이제 DM으로 봇을 쓸 수 있어` : `${target}는 이미 허용돼 있어`);
   });
 
   bot.command("disallow", async (ctx) => {
@@ -403,7 +445,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     const result = await access.remove(target);
     console.log(`[deploy-bot] disallow user=${target} by=${ctx.from?.id} result=${result}`);
     const messages = {
-      removed: `🚫 ${target} 허용 취소했어`,
+      removed: `${target} 허용 취소했어`,
       env: `${target}는 .env의 ALLOWED_USER_IDS에 있어서 봇에서는 못 빼. .env에서 지우고 재시작해줘`,
       admin: `${target}는 관리자라서 못 빼 (ADMIN_USER_IDS)`,
       missing: `${target}는 허용 목록에 없어`,
@@ -436,84 +478,77 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     const result = await access.add(target);
     console.log(`[deploy-bot] allow user=${target} by=${ctx.from.id} result=${result} via=request`);
     await ctx.answerCallbackQuery({ text: result === "added" ? "허용했어" : "이미 허용돼 있어" });
-    await ctx.api.sendMessage(target, "✅ 관리자가 허용했어. /help 로 사용법 확인해").catch(() => undefined);
+    await ctx.api.sendMessage(target, "관리자가 허용했어. /help 로 사용법 확인해").catch(() => undefined);
   });
 
-  const statusIcon = (s: string) => ({ done: "🟢", running: "🟡", error: "🔴", idle: "⚪️" })[s] ?? "⚪️";
+  const statusWord = (s: string) => ({ done: "정상", running: "배포 중", error: "실패", idle: "대기" })[s] ?? s;
 
   bot.command("list", async (ctx) => {
     const services = await deployer.listManaged();
     if (services.length === 0) return notice(ctx, "아직 봇으로 배포한 서비스가 없어. /deploy &lt;github url&gt;");
-    const fallback = ["📋 <b>관리 중인 서비스</b>", ...services.map((s) => `${statusIcon(s.status)} ${esc(s.repo)} · ${esc(`${s.projectName}/${s.environmentName}`)} <i>${s.kind === "compose" ? "compose" : "app"}</i>`)].join("\n");
+    const fallback = ["<b>관리 중인 서비스</b>", ...services.map((s) => `${esc(s.repo)} · ${esc(`${s.projectName}/${s.environmentName}`)} · ${statusWord(s.status)}`)].join("\n");
     const rows = services
-      .map((s) => `<tr><td>${statusIcon(s.status)}</td><td>${esc(s.repo)}</td><td>${esc(`${s.projectName} / ${s.environmentName}`)}</td><td>${s.kind === "compose" ? "compose" : "app"}</td></tr>`)
+      .map((s) => `<tr><td>${esc(s.repo)}</td><td>${esc(`${s.projectName} / ${s.environmentName}`)}</td><td>${s.kind === "compose" ? "compose" : "app"}</td><td>${statusWord(s.status)}</td></tr>`)
       .join("");
-    const html = `<h3>📋 관리 중인 서비스 (${services.length})</h3><table bordered striped compact><tr><th></th><th>레포</th><th>프로젝트 / 환경</th><th>종류</th></tr>${rows}</table>`;
-    await sendRich(ctx.api, whereOf(ctx), html, fallback, new InlineKeyboard());
+    const html = `<h3>관리 중인 서비스 (${services.length})</h3><table bordered striped compact><tr><th>레포</th><th>프로젝트 / 환경</th><th>종류</th><th>상태</th></tr>${rows}</table>`;
+    await sendRich(ctx.api, whereOf(ctx), html, fallback, []);
   });
 
-  const wizardKeyboard = (token: string, w: Wizard): InlineKeyboard => {
-    const kb = new InlineKeyboard();
-    if (w.awaiting) return kb.text("↩️ 버튼으로 고르기", `wz:${token}:back:${w.step}`).text("취소", `wz:${token}:cancel`).danger();
+  const wizardRows = (token: string, w: Wizard): RichButton[][] => {
+    const cb = (label: string, action: string, style?: RichButton["style"]): RichButton => ({ label, data: `wz:${token}:${action}`, style });
+    const cancel = cb("취소", "cancel", "danger");
+    const pairs = (items: RichButton[]) => Array.from({ length: Math.ceil(items.length / 2) }, (_, i) => items.slice(i * 2, i * 2 + 2));
+    if (w.awaiting) return [[cb("버튼으로 고르기", `back:${w.step}`), cancel]];
     if (w.step === "build") {
-      const aiReady = cfg.ai !== null;
-      w.options.choices.forEach((choice, i) => {
-        const label = `${choice === w.options.recommended ? "⭐ " : ""}${BUILD_LABELS[choice]}`;
-        if (choice === "ai_dockerfile" && !aiReady) kb.disabled(`${BUILD_LABELS[choice]} (AI 키 없음)`);
-        else kb.text(label, `wz:${token}:b:${choice}`);
-        if (choice === w.options.recommended) kb.primary();
-        if (i % 2 === 1) kb.row();
+      const items = w.options.choices.map((choice): RichButton => {
+        const label = BUILD_LABELS[choice];
+        if (choice === "ai_dockerfile" && cfg.ai === null) return { label: `${label} (AI 키 없음)`, disabled: true };
+        return choice === w.options.recommended ? cb(`${label} (추천)`, `b:${choice}`, "primary") : cb(label, `b:${choice}`);
       });
-      if (w.options.choices.length % 2 === 1) kb.row();
-      kb.text("취소", `wz:${token}:cancel`).danger();
-    } else if (w.step === "project") {
-      const suggested = suggestProjectName(w.repo);
-      const exists = w.projects.some((p) => p.name === suggested);
-      if (!exists) kb.text(`✨ 새로 만들기: ${suggested}`, `wz:${token}:pnew`).primary().row();
-      const listed = w.projects.slice(0, 10);
-      listed.forEach((p, i) => {
-        kb.text(`📁 ${p.name}`, `wz:${token}:p:${p.projectId}`);
-        if (p.name === suggested) kb.primary();
-        if (i % 2 === 1) kb.row();
-      });
-      if (listed.length % 2 === 1) kb.row();
-      kb.text("✏️ 이름 직접 입력", `wz:${token}:ptype`).row();
-      kb.text("⬅️ 뒤로", `wz:${token}:back:build`).text("취소", `wz:${token}:cancel`).danger();
-    } else if (w.step === "env") {
-      const project = w.projects.find((p) => p.projectId === w.target?.projectId);
-      const envs = project?.environments ?? [];
-      const names = new Set(envs.map((e) => e.name));
-      if (envs.length === 0) kb.text("🌱 production", `wz:${token}:enew:production`).primary();
-      envs.forEach((e, i) => {
-        kb.text(`🌱 ${e.name}${e.isDefault ? " (기본)" : ""}`, `wz:${token}:e:${e.environmentId}`);
-        if (e.isDefault) kb.primary();
-        if (i % 2 === 1) kb.row();
-      });
-      kb.row();
-      for (const extra of ["staging", "dev"].filter((n) => !names.has(n))) kb.text(`＋ ${extra}`, `wz:${token}:enew:${extra}`);
-      kb.text("✏️ 직접 입력", `wz:${token}:etype`).row();
-      kb.text("⬅️ 뒤로", `wz:${token}:back:project`).text("취소", `wz:${token}:cancel`).danger();
-    } else if (w.step === "domain") {
-      kb.text(`🌐 ${defaultDomain(w, cfg.baseDomain)}`, `wz:${token}:dsug`).primary().row();
-      kb.text("✏️ 직접 입력", `wz:${token}:dtype`).text("🚫 도메인 없이", `wz:${token}:dnone`).row();
-      kb.text("⬅️ 뒤로", `wz:${token}:back:env`).text("취소", `wz:${token}:cancel`).danger();
-    } else {
-      kb.text("🚀 배포하기", `wz:${token}:go`).success().row();
-      kb.text("⬅️ 뒤로", `wz:${token}:back:domain`).text("취소", `wz:${token}:cancel`).danger();
+      return [...pairs(items), [cancel]];
     }
-    return kb;
+    if (w.step === "project") {
+      const suggested = suggestProjectName(w.repo);
+      const rows: RichButton[][] = [];
+      if (!w.projects.some((p) => p.name === suggested)) rows.push([cb(`새 프로젝트: ${suggested} (추천)`, "pnew", "primary")]);
+      const listed = w.projects.slice(0, 10).map((p) => (p.name === suggested ? cb(`${p.name} (추천)`, `p:${p.projectId}`, "primary") : cb(p.name, `p:${p.projectId}`)));
+      rows.push(...pairs(listed), [cb("이름 직접 입력", "ptype")], [cb("뒤로", "back:build"), cancel]);
+      return rows;
+    }
+    if (w.step === "env") {
+      const envs = w.projects.find((p) => p.projectId === w.target?.projectId)?.environments ?? [];
+      const names = new Set(envs.map((x) => x.name));
+      const items =
+        envs.length === 0
+          ? [cb("production (추천)", "enew:production", "primary")]
+          : envs.map((x) => cb(`${x.name}${x.isDefault ? " (기본)" : ""}`, `e:${x.environmentId}`, x.isDefault ? "primary" : undefined));
+      const extra = ["staging", "dev"].filter((n) => !names.has(n)).map((n) => cb(`＋ ${n}`, `enew:${n}`));
+      return [...pairs(items), [...extra, cb("직접 입력", "etype")], [cb("뒤로", "back:project"), cancel]];
+    }
+    if (w.step === "domain") {
+      return [
+        [cb(`${defaultDomain(w, cfg.baseDomain)} (추천)`, "dsug", "primary")],
+        [cb("직접 입력", "dtype"), cb("도메인 없이", "dnone")],
+        [cb("뒤로", "back:env"), cancel],
+      ];
+    }
+    return [[cb("배포하기", "go", "success")], [cb("뒤로", "back:domain"), cancel]];
   };
 
-  const render = async (ctx: Context, token: string, w: Wizard) => {
-    await ctx.api
-      .editMessageText(w.place.chatId, w.messageId, wizardText(w, cfg), { ...HTML, reply_markup: wizardKeyboard(token, w) })
-      .catch((error: unknown) => {
-        if (!String(error).includes("message is not modified")) throw error;
+  const render = async (ctx: Context, token: string, w: Wizard, frozen: string | null = null) => {
+    const rows: RichButton[][] = frozen ? [[{ label: frozen, disabled: true }]] : wizardRows(token, w);
+    try {
+      await ctx.api.editMessageText(w.place.chatId, w.messageId, { html: richParagraphs(wizardText(w, cfg)) + richRows(rows) });
+    } catch (error) {
+      if (String(error).includes("message is not modified")) return;
+      console.warn("[deploy-bot] rich wizard failed, falling back to HTML:", error instanceof Error ? error.message : error);
+      await ctx.api.editMessageText(w.place.chatId, w.messageId, wizardText(w, cfg), { ...HTML, reply_markup: toInline(rows) }).catch((err: unknown) => {
+        if (!String(err).includes("message is not modified")) throw err;
       });
+    }
   };
 
-  const freezeWizard = (ctx: Context, w: Wizard, label: string) =>
-    ctx.api.editMessageReplyMarkup(w.place.chatId, w.messageId, { reply_markup: new InlineKeyboard().disabled(label) }).catch(() => undefined);
+  const freezeWizard = (ctx: Context, token: string, w: Wizard, label: string) => render(ctx, token, w, label).catch(() => undefined);
 
   bot.command("deploy", async (ctx) => {
     const ref = parseRepoUrl(ctx.match);
@@ -522,7 +557,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     if (userId === undefined) return;
     await react(ctx, "👀");
 
-    const status = await ctx.reply(`🔍 ${bold(`${ref.owner}/${ref.repo}`)} 분석 중...`, HTML);
+    const status = await ctx.reply(`${bold(`${ref.owner}/${ref.repo}`)} 분석 중...`, HTML);
     await ctx.replyWithChatAction("typing").catch(() => undefined);
     try {
       const [repo, projects, existing] = await Promise.all([gh.repo(ref), deployer.listProjects(), deployer.findByRepo(ref)]);
@@ -555,14 +590,14 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
         const kb = new InlineKeyboard();
         for (const s of existing.slice(0, 5)) {
           const k = s.kind === "application" ? "a" : "c";
-          if (busy.has(s.repo)) kb.disabled(`⏳ ${s.projectName}/${s.environmentName} 진행 중`).row();
-          else kb.text(`⬇️ ${s.projectName}/${s.environmentName} 업데이트`, `run:u:${k}:${s.id}`).row();
+          if (busy.has(s.repo)) kb.disabled(`${s.projectName}/${s.environmentName} 진행 중`).row();
+          else kb.text(`${s.projectName}/${s.environmentName} 업데이트`, `run:u:${k}:${s.id}`).row();
         }
-        await ctx.reply(`ℹ️ 이 레포는 이미 ${existing.length}곳에 배포돼 있어. 새로 만드는 대신 업데이트할 수도 있어.`, { reply_markup: kb });
+        await ctx.reply(`이 레포는 이미 ${existing.length}곳에 배포돼 있어. 새로 만드는 대신 업데이트할 수도 있어.`, { reply_markup: kb });
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await ctx.api.editMessageText(status.chat.id, status.message_id, `❌ ${esc(message)}`, HTML).catch(() => undefined);
+      await ctx.api.editMessageText(status.chat.id, status.message_id, `${esc(message)}`, HTML).catch(() => undefined);
     }
   });
 
@@ -599,7 +634,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     const reply_markup = isPrivate
       ? new InlineKeyboard().text("취소", `wz:${token}:back:${w.step}`).forceReply()
       : { force_reply: true as const, selective: true, input_field_placeholder: hint.slice(0, 64) };
-    const prompt = await ctx.api.sendMessage(w.place.chatId, `✏️ ${isPrivate ? "" : `${mention} `}${esc(hint)}`, { ...HTML, ...threadOf(w.place), reply_markup });
+    const prompt = await ctx.api.sendMessage(w.place.chatId, `${isPrivate ? "" : `${mention} `}${esc(hint)}`, { ...HTML, ...threadOf(w.place), reply_markup });
     w.promptId = prompt.message_id;
   };
 
@@ -612,7 +647,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
       wizards.delete(token);
       await clearPrompt(ctx, w);
       await ctx.answerCallbackQuery({ text: "취소했어" });
-      await ctx.editMessageText(`🚫 ${bold(`${w.repo.owner}/${w.repo.repo}`)} 배포 취소`, HTML).catch(() => undefined);
+      await ctx.editMessageText(`${bold(`${w.repo.owner}/${w.repo.repo}`)} 배포 취소`, HTML).catch(() => undefined);
       return;
     }
     if (action === "go") {
@@ -698,7 +733,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     const full: FullResult = { ...result, dashboard: deployer.dashboardUrl(result.service) };
     await live.remove();
     const effect = result.status === "done" && ctx.chat?.type === "private" ? SUCCESS_EFFECT_ID : null;
-    await sendRich(ctx.api, place, resultRich(full), resultText(full, cfg), resultKeyboard(full), effect);
+    await sendRich(ctx.api, place, resultRich(full), resultText(full, cfg), resultButtons(full), effect);
   };
 
   const startDeploy = async (ctx: Context, token: string, w: Wizard) => {
@@ -711,18 +746,18 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     wizards.delete(token);
     const target = w.target;
     const domain = w.domain ?? null;
-    await freezeWizard(ctx, w, "⏳ 배포 진행 중...");
+    await freezeWizard(ctx, token, w, "배포 진행 중...");
     busy.add(key);
     background(ctx, async () => {
-      let label = "❌ 실패";
+      let label = "배포 실패";
       try {
-        const live = new LiveStatus(ctx.api, w.place, `🚀 ${bold(key)} → ${esc(`${target.projectName} / ${target.environmentName}`)}`);
+        const live = new LiveStatus(ctx.api, w.place, `${bold(key)} → ${esc(`${target.projectName} / ${target.environmentName}`)}`);
         const result = await deployer.deploy({ repo: w.repo, files: w.files, plan: w.plan, domain, target }, live);
-        label = result.status === "done" ? "✅ 배포 완료" : "❌ 배포 실패";
+        label = result.status === "done" ? "배포 완료" : "배포 실패";
         await finishRun(ctx, w.place, live, result);
       } finally {
         busy.delete(key);
-        await freezeWizard(ctx, w, label);
+        await freezeWizard(ctx, token, w, label);
       }
     });
   };
@@ -737,7 +772,7 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     busy.add(service.repo);
     background(ctx, async () => {
       try {
-        const label = mode === "update" ? "⬇️ 최신 코드로 업데이트" : "🔁 다시 빌드";
+        const label = mode === "update" ? "최신 코드로 업데이트" : "다시 빌드";
         const live = new LiveStatus(ctx.api, place, `${label} ${bold(service.repo)} · ${esc(`${service.projectName} / ${service.environmentName}`)}`);
         await live.step(mode === "update" ? "GitHub에서 최신 코드 받는 중" : "기존 코드로 빌드 시작");
         const outcome: RunOutcome = await deployer.runAndWait(service, mode === "update" ? "deploy" : "redeploy", live);
@@ -772,8 +807,8 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     const list = chosen.length > 0 ? chosen : services;
     const kb = new InlineKeyboard();
     for (const s of list.slice(0, MAX_PICKER_ITEMS)) {
-      const label = `${statusIcon(s.status)} ${s.repo} · ${s.environmentName}`;
-      if (prefix !== "log:r" && busy.has(s.repo)) kb.disabled(`⏳ ${label}`);
+      const label = `${s.repo} · ${s.environmentName}`;
+      if (prefix !== "log:r" && busy.has(s.repo)) kb.disabled(`${label} (진행 중)`);
       else kb.text(label, `${prefix}:${s.kind === "application" ? "a" : "c"}:${s.id}`);
       kb.row();
     }
@@ -790,8 +825,8 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     const log = await deployer.runtimeLog(service).catch((e: unknown) => `로그를 못 가져왔어: ${e instanceof Error ? e.message : String(e)}`);
     const k = service.kind === "application" ? "a" : "c";
     await ctx.reply(
-      [`🖥 ${bold(service.repo)} 실행 로그 <i>(최근)</i>`, log ? logBlock(log) : "<i>로그가 아직 없어</i>"].join("\n"),
-      { ...HTML, reply_markup: new InlineKeyboard().text("🔄 새로고침", `log:r:${k}:${service.id}`).url("🧭 Dokploy", deployer.dashboardUrl(service)) },
+      [`${bold(service.repo)} 실행 로그 <i>(최근)</i>`, log ? logBlock(log) : "<i>로그가 아직 없어</i>"].join("\n"),
+      { ...HTML, reply_markup: new InlineKeyboard().text("새로고침", `log:r:${k}:${service.id}`).url("Dokploy", deployer.dashboardUrl(service)) },
     );
   };
 
@@ -830,13 +865,13 @@ export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(
     if (!service) return ctx.answerCallbackQuery({ text: "서비스를 찾을 수 없어" });
     await ctx.answerCallbackQuery();
     const log = await deployer.buildLog(deploymentId, 300);
-    await ctx.reply([`📜 ${bold(service.repo)} 빌드 로그`, log ? logBlock(log) : "<i>로그가 없어</i>"].join("\n"), HTML);
+    await ctx.reply([`${bold(service.repo)} 빌드 로그`, log ? logBlock(log) : "<i>로그가 없어</i>"].join("\n"), HTML);
   });
 
   bot.catch(async (err) => {
     console.error("[deploy-bot]", err.error);
     const message = err.error instanceof Error ? err.error.message : String(err.error);
-    await err.ctx.reply(`❌ 오류: ${esc(message).slice(0, MAX_MESSAGE)}`, HTML).catch(() => undefined);
+    await err.ctx.reply(`오류: ${esc(message).slice(0, MAX_MESSAGE)}`, HTML).catch(() => undefined);
   });
 
   return { bot, idle: async () => void (await Promise.all([...jobs])) };
