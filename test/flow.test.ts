@@ -10,6 +10,8 @@ import { GitHub } from "../src/github.ts";
 const OWNER_ID = 111;
 const STRANGER_ID = 999;
 const CHAT_ID = 5000;
+const GROUP_ID = -100777;
+const OTHER_GROUP_ID = -100888;
 
 interface Call {
   path: string;
@@ -172,6 +174,7 @@ function setup() {
   const cfg = loadConfig({
     TELEGRAM_BOT_TOKEN: "123:abc",
     ALLOWED_USER_IDS: String(OWNER_ID),
+    ALLOWED_CHAT_IDS: String(GROUP_ID),
     DOKPLOY_URL: "http://dokploy.test",
     DOKPLOY_API_KEY: "dk-key",
     AI_API_KEY: "ai-key",
@@ -205,12 +208,15 @@ let updateId = 0;
 const from = (id: number) => ({ id, is_bot: false, first_name: "u" });
 const chat = { id: CHAT_ID, type: "private" as const, first_name: "u" };
 
-function command(text: string, userId = OWNER_ID): Update {
+type AnyChat = typeof chat | { id: number; type: "supergroup"; title: string };
+const group = (id: number): AnyChat => ({ id, type: "supergroup", title: "team" });
+
+function command(text: string, userId = OWNER_ID, inChat: AnyChat = chat): Update {
   const name = text.split(" ")[0] ?? text;
   return {
     update_id: ++updateId,
-    message: { message_id: ++updateId, date: 0, chat, from: from(userId), text, entities: [{ type: "bot_command", offset: 0, length: name.length }] },
-  };
+    message: { message_id: ++updateId, date: 0, chat: inChat, from: from(userId), text, entities: [{ type: "bot_command", offset: 0, length: name.length }] },
+  } as Update;
 }
 
 function click(data: string, userId = OWNER_ID): Update {
@@ -327,6 +333,26 @@ describe("telegram flow", () => {
     await bot.handleUpdate(command("/deploy https://github.com/h053698/hello"));
     expect(buttons(sent.at(-1)).map((b) => b.callback_data)).toEqual(["run:u:a:id-hello", "run:r:a:id-hello"]);
     expect(dk.paths()).not.toContain("application.create");
+  });
+
+  test("any member of an allowed group can use the bot there", async () => {
+    const { bot, dk, sent } = setup();
+    await bot.handleUpdate(command("/deploy@deploy_bot https://github.com/h053698/hello", STRANGER_ID, group(GROUP_ID)));
+    expect(String(sent.find((s) => s.method === "editMessageText")?.payload.text)).toContain("도메인은 어떻게 할까?");
+    expect(dk.paths()).toContain("project.all");
+  });
+
+  test("other groups are rejected even for allowed users, and the reply shows the group id", async () => {
+    const { bot, dk, sent } = setup();
+    await bot.handleUpdate(command("/deploy https://github.com/h053698/hello", OWNER_ID, group(OTHER_GROUP_ID)));
+    expect(String(sent[0]?.payload.text)).toContain(String(OTHER_GROUP_ID));
+    expect(dk.calls).toEqual([]);
+  });
+
+  test("plain group chatter from a non-allowed group gets no reply", async () => {
+    const { bot, sent } = setup();
+    await bot.handleUpdate({ update_id: ++updateId, message: { message_id: ++updateId, date: 0, chat: group(OTHER_GROUP_ID), from: from(OWNER_ID), text: "hello" } } as Update);
+    expect(sent).toEqual([]);
   });
 
   test("unauthorized users are rejected and nothing reaches Dokploy", async () => {

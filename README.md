@@ -28,7 +28,11 @@ A partial or empty name brings up buttons to choose from. Only services the bot 
 1. Create a bot with @BotFather and get the token.
 2. Create an API key in Dokploy under Settings → Profile → API/CLI.
 3. **Wildcard DNS**: point `*.arpa.page` with an A record to the Dokploy server IP (`182.215.187.53`). Without it the domain won't resolve, and the Let's Encrypt certificate can't be issued either.
-4. Copy `.env.example` to `.env` and fill it in. For `ALLOWED_USER_IDS`, send `/start` to the bot; it replies with your ID.
+4. Copy `.env.example` to `.env` and fill it in.
+   - `ALLOWED_USER_IDS`: users who can use the bot in DMs. Send `/start` in a DM and the bot replies with your ID.
+   - `ALLOWED_CHAT_IDS`: groups where any member can use the bot. Invite the bot and send `/start@<bot username>`; it replies with the group ID.
+   - Any other DM or group is denied. In groups the bot ignores plain chatter and only answers commands.
+   - `TELEGRAM_PROXY`: set this only if `api.telegram.org` is unreachable directly (for example `http://127.0.0.1:7897`).
 
 ```sh
 bun install

@@ -29,6 +29,17 @@ const MAX_MESSAGE = 3800;
 
 const clip = (text: string, max = MAX_MESSAGE) => (text.length > max ? `${text.slice(0, max)}\n…` : text);
 
+export function isAllowed(
+  chat: { id: number; type: string } | undefined,
+  userId: number | undefined,
+  cfg: Pick<Config, "allowedUserIds" | "allowedChatIds">,
+): boolean {
+  if (!chat || userId === undefined) return false;
+  if (chat.type === "private") return cfg.allowedUserIds.has(userId);
+  if (chat.type === "group" || chat.type === "supergroup") return cfg.allowedChatIds.has(chat.id);
+  return false;
+}
+
 function describePlan(plan: BuildPlan, railpackVersion: string): string {
   if (plan.kind === "compose") {
     return `Docker Compose (${plan.composePath}) · 도메인 연결 서비스: ${plan.serviceName} (전체: ${plan.services.join(", ")})`;
@@ -121,9 +132,21 @@ export function createBot({ cfg, deployer, gh }: BotDeps, bot = new Bot(cfg.tele
 
   bot.use(async (ctx, next) => {
     const id = ctx.from?.id;
-    if (id !== undefined && cfg.allowedUserIds.has(id)) return next();
-    if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "권한 없음" });
-    else if (ctx.message) await ctx.reply(`⛔ 권한이 없어. 관리자에게 이 ID를 등록해 달라고 해: ${id ?? "unknown"}`);
+    const isCommand = ctx.message?.entities?.[0]?.type === "bot_command" && ctx.message.entities[0].offset === 0;
+    if (isAllowed(ctx.chat, id, cfg)) {
+      if (isCommand) console.log(`[deploy-bot] cmd ${ctx.message?.text?.split(" ")[0]} chat=${ctx.chat?.id} user=${id}`);
+      return next();
+    }
+    if (ctx.callbackQuery || isCommand) {
+      console.warn(`[deploy-bot] denied chat=${ctx.chat?.id} type=${ctx.chat?.type} user=${id}`);
+    }
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: "권한 없음" });
+    } else if (isCommand && ctx.chat?.type === "private") {
+      await ctx.reply(`⛔ 권한이 없어. 관리자에게 이 ID를 등록해 달라고 해: ${id ?? "unknown"}`);
+    } else if (isCommand && ctx.chat) {
+      await ctx.reply(`⛔ 이 그룹에서는 쓸 수 없어. 그룹 ID: ${ctx.chat.id}`);
+    }
   });
 
   bot.command(["start", "help"], (ctx) =>
@@ -228,7 +251,9 @@ export function createBot({ cfg, deployer, gh }: BotDeps, bot = new Bot(cfg.tele
       await ctx.reply("취소했어");
     } else if (choice === "custom") {
       p.awaitingCustomDomain = true;
-      await ctx.reply(`쓸 도메인을 보내줘. 예: myapp 또는 myapp.${cfg.baseDomain} 또는 app.example.com`);
+      await ctx.reply(`쓸 도메인을 답장으로 보내줘. 예: myapp 또는 myapp.${cfg.baseDomain} 또는 app.example.com`, {
+        reply_markup: { force_reply: true, selective: true },
+      });
     } else {
       await startDeploy(ctx, token, p, choice === "default" ? p.defaultDomain : null);
     }

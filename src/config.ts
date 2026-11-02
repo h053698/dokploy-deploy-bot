@@ -7,7 +7,9 @@ export interface AiConfig {
 
 export interface Config {
   telegramToken: string;
+  telegramProxy: string | null;
   allowedUserIds: Set<number>;
+  allowedChatIds: Set<number>;
   dokployUrl: string;
   dokployApiKey: string;
   dokployProject: string;
@@ -43,19 +45,23 @@ function positiveInt(env: Env, key: string, fallback: number): number {
   return value;
 }
 
-export function loadConfig(env: Env = process.env): Config {
-  const allowedUserIds = new Set(
-    required(env, "ALLOWED_USER_IDS")
+function idSet(env: Env, key: string): Set<number> {
+  return new Set(
+    (optional(env, key) ?? "")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean)
       .map((s) => {
         const id = Number(s);
-        if (!Number.isSafeInteger(id)) throw new Error(`ALLOWED_USER_IDS contains a non-numeric id "${s}"`);
+        if (!Number.isSafeInteger(id)) throw new Error(`${key} contains a non-numeric id "${s}"`);
         return id;
       }),
   );
-  if (allowedUserIds.size === 0) throw new Error("ALLOWED_USER_IDS must list at least one Telegram user id");
+}
+
+export function loadConfig(env: Env = process.env): Config {
+  const allowedUserIds = idSet(env, "ALLOWED_USER_IDS");
+  const allowedChatIds = idSet(env, "ALLOWED_CHAT_IDS");
 
   const aiKey = optional(env, "AI_API_KEY");
   let ai: AiConfig | null = null;
@@ -70,7 +76,9 @@ export function loadConfig(env: Env = process.env): Config {
 
   return {
     telegramToken: required(env, "TELEGRAM_BOT_TOKEN"),
+    telegramProxy: optional(env, "TELEGRAM_PROXY"),
     allowedUserIds,
+    allowedChatIds,
     dokployUrl: required(env, "DOKPLOY_URL").replace(/\/+$/, ""),
     dokployApiKey: required(env, "DOKPLOY_API_KEY"),
     dokployProject: optional(env, "DOKPLOY_PROJECT") ?? "deploy-bot",
