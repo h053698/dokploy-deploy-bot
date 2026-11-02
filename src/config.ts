@@ -10,6 +10,8 @@ export interface Config {
   telegramProxy: string | null;
   allowedUserIds: Set<number>;
   allowedChatIds: Set<number>;
+  adminUserIds: Set<number>;
+  accessFile: string;
   dokployUrl: string;
   dokployApiKey: string;
   dokployProject: string;
@@ -79,6 +81,8 @@ export function loadConfig(env: Env = process.env): Config {
     telegramProxy: optional(env, "TELEGRAM_PROXY"),
     allowedUserIds,
     allowedChatIds,
+    adminUserIds: idSet(env, "ADMIN_USER_IDS"),
+    accessFile: optional(env, "ACCESS_FILE") ?? "data/access.json",
     dokployUrl: required(env, "DOKPLOY_URL").replace(/\/+$/, ""),
     dokployApiKey: required(env, "DOKPLOY_API_KEY"),
     dokployProject: optional(env, "DOKPLOY_PROJECT") ?? "deploy-bot",

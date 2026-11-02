@@ -20,6 +20,9 @@ A Telegram bot that deploys GitHub repos to Dokploy with one command.
 | `/update [name]` | Pulls the latest GitHub code and deploys again (Dokploy `deploy`) |
 | `/redeploy [name]` | Rebuilds the already-cloned code without pulling (Dokploy `redeploy`) |
 | `/list` | Lists services the bot manages |
+| `/allow <user id>` | Admin only. Lets that user use the bot in DMs. In a group you can also reply to the person's message with `/allow` |
+| `/disallow <user id>` | Admin only. Removes a user added with `/allow` |
+| `/allowed` | Admin only. Shows admins, allowed users, and allowed groups |
 
 A partial or empty name brings up buttons to choose from. Only services the bot created (description `deploy-bot repo:owner/repo`, inside the `DOKPLOY_PROJECT` project) are managed.
 
@@ -29,7 +32,8 @@ A partial or empty name brings up buttons to choose from. Only services the bot 
 2. Create an API key in Dokploy under Settings → Profile → API/CLI.
 3. **Wildcard DNS**: point `*.arpa.page` with an A record to the Dokploy server IP (`182.215.187.53`). Without it the domain won't resolve, and the Let's Encrypt certificate can't be issued either.
 4. Copy `.env.example` to `.env` and fill it in.
-   - `ALLOWED_USER_IDS`: users who can use the bot in DMs. Send `/start` in a DM and the bot replies with your ID.
+   - `ADMIN_USER_IDS`: admins. They can use the bot in DMs and manage users with `/allow`, `/disallow`, `/allowed`. When someone who is not allowed DMs the bot, every admin gets a request with an approve button.
+   - `ALLOWED_USER_IDS`: users who can use the bot in DMs. Send `/start` in a DM and the bot replies with your ID. Users added with `/allow` are stored in `ACCESS_FILE` (default `data/access.json`) and survive restarts; mount `/app/data` as a volume when running in Docker.
    - `ALLOWED_CHAT_IDS`: groups where any member can use the bot. Invite the bot and send `/start@<bot username>`; it replies with the group ID.
    - Any other DM or group is denied. In groups the bot ignores plain chatter and only answers commands.
    - `TELEGRAM_PROXY`: set this only if `api.telegram.org` is unreachable directly (for example `http://127.0.0.1:7897`).

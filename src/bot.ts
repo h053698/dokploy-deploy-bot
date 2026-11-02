@@ -1,5 +1,6 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import { analyzeRepo, type BuildPlan, normalizeDomain, subdomainFor } from "./analyze.ts";
+import type { Access } from "./access.ts";
 import type { Config } from "./config.ts";
 import type { Deployer, DeployResult, ManagedService } from "./deployer.ts";
 import { type GitHub, parseRepoUrl, type RepoInfo, repoKey } from "./github.ts";
@@ -19,6 +20,7 @@ type Mode = "update" | "redeploy";
 
 export interface BotDeps {
   cfg: Config;
+  access: Access;
   deployer: Deployer;
   gh: GitHub;
 }
@@ -32,12 +34,18 @@ const clip = (text: string, max = MAX_MESSAGE) => (text.length > max ? `${text.s
 export function isAllowed(
   chat: { id: number; type: string } | undefined,
   userId: number | undefined,
-  cfg: Pick<Config, "allowedUserIds" | "allowedChatIds">,
+  access: Pick<Access, "isUser">,
+  allowedChatIds: ReadonlySet<number>,
 ): boolean {
   if (!chat || userId === undefined) return false;
-  if (chat.type === "private") return cfg.allowedUserIds.has(userId);
-  if (chat.type === "group" || chat.type === "supergroup") return cfg.allowedChatIds.has(chat.id);
+  if (chat.type === "private") return access.isUser(userId);
+  if (chat.type === "group" || chat.type === "supergroup") return allowedChatIds.has(chat.id);
   return false;
+}
+
+function parseUserId(text: string): number | null {
+  const id = Number(text.trim());
+  return text.trim() && Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
 function describePlan(plan: BuildPlan, railpackVersion: string): string {
@@ -108,8 +116,22 @@ class ProgressMessage {
   };
 }
 
-export function createBot({ cfg, deployer, gh }: BotDeps, bot = new Bot(cfg.telegramToken)) {
+export function createBot({ cfg, access, deployer, gh }: BotDeps, bot = new Bot(cfg.telegramToken)) {
   const pending = new Map<string, PendingDeploy>();
+  const notifiedRequests = new Set<number>();
+
+  const notifyAdmins = async (ctx: Context, userId: number) => {
+    if (notifiedRequests.has(userId)) return;
+    notifiedRequests.add(userId);
+    const u = ctx.from;
+    const who = [u?.first_name, u?.last_name].filter(Boolean).join(" ") + (u?.username ? ` (@${u.username})` : "");
+    const keyboard = new InlineKeyboard().text("✅ 허용", `acl:add:${userId}`).text("무시", `acl:ignore:${userId}`);
+    for (const admin of access.list().admins) {
+      await ctx.api
+        .sendMessage(admin, `🔐 접근 요청: ${who || "이름 없음"} · ID ${userId}`, { reply_markup: keyboard })
+        .catch((error: unknown) => console.warn(`[deploy-bot] could not notify admin ${admin}:`, error instanceof Error ? error.message : error));
+    }
+  };
   const busy = new Set<string>();
   const jobs = new Set<Promise<void>>();
   let seq = 0;
@@ -133,7 +155,7 @@ export function createBot({ cfg, deployer, gh }: BotDeps, bot = new Bot(cfg.tele
   bot.use(async (ctx, next) => {
     const id = ctx.from?.id;
     const isCommand = ctx.message?.entities?.[0]?.type === "bot_command" && ctx.message.entities[0].offset === 0;
-    if (isAllowed(ctx.chat, id, cfg)) {
+    if (isAllowed(ctx.chat, id, access, cfg.allowedChatIds)) {
       if (isCommand) console.log(`[deploy-bot] cmd ${ctx.message?.text?.split(" ")[0]} chat=${ctx.chat?.id} user=${id}`);
       return next();
     }
@@ -143,7 +165,8 @@ export function createBot({ cfg, deployer, gh }: BotDeps, bot = new Bot(cfg.tele
     if (ctx.callbackQuery) {
       await ctx.answerCallbackQuery({ text: "권한 없음" });
     } else if (isCommand && ctx.chat?.type === "private") {
-      await ctx.reply(`⛔ 권한이 없어. 관리자에게 이 ID를 등록해 달라고 해: ${id ?? "unknown"}`);
+      await ctx.reply(`⛔ 권한이 없어. 관리자에게 접근 요청을 보냈어. 내 ID: ${id ?? "unknown"}`);
+      if (id !== undefined) await notifyAdmins(ctx, id);
     } else if (isCommand && ctx.chat) {
       await ctx.reply(`⛔ 이 그룹에서는 쓸 수 없어. 그룹 ID: ${ctx.chat.id}`);
     }
@@ -159,9 +182,79 @@ export function createBot({ cfg, deployer, gh }: BotDeps, bot = new Bot(cfg.tele
         "/list - 봇이 관리하는 서비스 목록",
         "",
         "레포이름은 일부만 쳐도 되고, 비워두면 버튼으로 고를 수 있어",
+        ...(access.isAdmin(ctx.from?.id)
+          ? ["", "관리자", "/allow <유저ID> - DM 사용 허용 (그룹에서 그 사람 메시지에 답장으로 /allow 해도 됨)", "/disallow <유저ID> - 허용 취소", "/allowed - 허용 목록"]
+          : []),
       ].join("\n"),
     ),
   );
+
+  const adminOnly = async (ctx: Context) => {
+    if (access.isAdmin(ctx.from?.id)) return true;
+    await ctx.reply("⛔ 관리자만 쓸 수 있어");
+    return false;
+  };
+
+  const targetOf = (ctx: Context & { match: string }) => {
+    const replied = ctx.message?.reply_to_message?.from;
+    return parseUserId(ctx.match) ?? (replied && !replied.is_bot ? replied.id : null);
+  };
+
+  bot.command("allow", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const target = targetOf(ctx);
+    if (target === null) return ctx.reply("사용법: /allow <유저ID> 또는 그 사람 메시지에 답장으로 /allow");
+    const result = await access.add(target);
+    console.log(`[deploy-bot] allow user=${target} by=${ctx.from?.id} result=${result}`);
+    return ctx.reply(result === "added" ? `✅ ${target} 허용했어. 이제 DM으로 봇을 쓸 수 있어` : `${target}는 이미 허용돼 있어`);
+  });
+
+  bot.command("disallow", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const target = targetOf(ctx);
+    if (target === null) return ctx.reply("사용법: /disallow <유저ID>");
+    const result = await access.remove(target);
+    console.log(`[deploy-bot] disallow user=${target} by=${ctx.from?.id} result=${result}`);
+    const messages = {
+      removed: `🚫 ${target} 허용 취소했어`,
+      env: `${target}는 .env의 ALLOWED_USER_IDS에 있어서 봇에서는 못 빼. .env에서 지우고 재시작해줘`,
+      admin: `${target}는 관리자라서 못 빼 (ADMIN_USER_IDS)`,
+      missing: `${target}는 허용 목록에 없어`,
+    } as const;
+    return ctx.reply(messages[result]);
+  });
+
+  bot.command("allowed", async (ctx) => {
+    if (!(await adminOnly(ctx))) return;
+    const { admins, env, added } = access.list();
+    const fmt = (ids: number[]) => (ids.length ? ids.join(", ") : "없음");
+    return ctx.reply(
+      [
+        `관리자: ${fmt(admins)}`,
+        `.env 허용: ${fmt(env)}`,
+        `봇으로 추가: ${fmt(added)}`,
+        `허용 그룹: ${fmt([...cfg.allowedChatIds])}`,
+      ].join("\n"),
+    );
+  });
+
+  bot.callbackQuery(/^acl:(add|ignore):(\d+)$/, async (ctx) => {
+    if (!access.isAdmin(ctx.from.id)) {
+      await ctx.answerCallbackQuery({ text: "관리자만 가능" });
+      return;
+    }
+    const [, action, raw = ""] = ctx.match;
+    const target = Number(raw);
+    await ctx.editMessageReplyMarkup().catch(() => undefined);
+    if (action === "ignore") {
+      await ctx.answerCallbackQuery({ text: "무시했어" });
+      return;
+    }
+    const result = await access.add(target);
+    console.log(`[deploy-bot] allow user=${target} by=${ctx.from.id} result=${result} via=request`);
+    await ctx.answerCallbackQuery({ text: result === "added" ? "허용했어" : "이미 허용돼 있어" });
+    await ctx.api.sendMessage(target, "✅ 관리자가 허용했어. /help 로 사용법 확인해").catch(() => undefined);
+  });
 
   bot.command("list", async (ctx) => {
     const services = await deployer.listManaged();

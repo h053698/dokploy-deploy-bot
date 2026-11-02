@@ -1,4 +1,5 @@
 import { Bot } from "grammy";
+import { Access } from "./access.ts";
 import { COMMANDS, createBot } from "./bot.ts";
 import { loadConfig } from "./config.ts";
 import { Deployer } from "./deployer.ts";
@@ -15,10 +16,11 @@ const telegram = new Bot(
     ? { client: { baseFetchConfig: {}, fetch: ((input, init) => fetch(input, { ...init, proxy })) as typeof fetch } }
     : {},
 );
-const { bot } = createBot({ cfg, deployer: new Deployer(cfg, dk, gh), gh }, telegram);
-if (cfg.allowedUserIds.size === 0 && cfg.allowedChatIds.size === 0) {
-  console.warn("[deploy-bot] ALLOWED_USER_IDS and ALLOWED_CHAT_IDS are empty: every chat is denied. Send /start to get ids.");
-}
+const access = await Access.load(cfg.accessFile, cfg.allowedUserIds, cfg.adminUserIds);
+const { bot } = createBot({ cfg, access, deployer: new Deployer(cfg, dk, gh), gh }, telegram);
+const acl = access.list();
+console.log(`[deploy-bot] admins=${acl.admins.length} users=${acl.env.length}+${acl.added.length} groups=${cfg.allowedChatIds.size} (${cfg.accessFile})`);
+if (acl.admins.length === 0) console.warn("[deploy-bot] ADMIN_USER_IDS is empty: nobody can use /allow.");
 
 const server = Bun.serve({
   port: Number(process.env.PORT ?? 3000),

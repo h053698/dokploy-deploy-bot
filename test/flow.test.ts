@@ -1,6 +1,10 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { Bot } from "grammy";
 import type { Update, UserFromGetMe } from "grammy/types";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Access } from "../src/access.ts";
 import { createBot } from "../src/bot.ts";
 import { loadConfig } from "../src/config.ts";
 import { Deployer } from "../src/deployer.ts";
@@ -12,6 +16,11 @@ const STRANGER_ID = 999;
 const CHAT_ID = 5000;
 const GROUP_ID = -100777;
 const OTHER_GROUP_ID = -100888;
+const ADMIN_ID = 222;
+const tempDirs: string[] = [];
+afterAll(async () => {
+  await Promise.all(tempDirs.map((d) => rm(d, { recursive: true, force: true })));
+});
 
 interface Call {
   path: string;
@@ -170,11 +179,12 @@ interface Sent {
   payload: Record<string, unknown>;
 }
 
-function setup() {
+async function setup() {
   const cfg = loadConfig({
     TELEGRAM_BOT_TOKEN: "123:abc",
     ALLOWED_USER_IDS: String(OWNER_ID),
     ALLOWED_CHAT_IDS: String(GROUP_ID),
+    ADMIN_USER_IDS: String(ADMIN_ID),
     DOKPLOY_URL: "http://dokploy.test",
     DOKPLOY_API_KEY: "dk-key",
     AI_API_KEY: "ai-key",
@@ -200,8 +210,12 @@ function setup() {
         : true;
     return { ok: true, result } as never;
   });
-  const { idle } = createBot({ cfg, deployer, gh: new GitHub(cfg.githubApiUrl, null, fakeGithub) }, bot);
-  return { bot, dk, sent, idle };
+  const dir = await mkdtemp(join(tmpdir(), "deploy-bot-acl-"));
+  tempDirs.push(dir);
+  const accessFile = join(dir, "access.json");
+  const access = await Access.load(accessFile, cfg.allowedUserIds, cfg.adminUserIds);
+  const { idle } = createBot({ cfg, access, deployer, gh: new GitHub(cfg.githubApiUrl, null, fakeGithub) }, bot);
+  return { bot, dk, sent, idle, accessFile, cfg };
 }
 
 let updateId = 0;
@@ -242,7 +256,7 @@ describe("telegram flow", () => {
   });
 
   test("/deploy asks domain, shows plan, deploys with railpack, falls back to AI Dockerfile", async () => {
-    const { bot, dk, sent, idle } = setup();
+    const { bot, dk, sent, idle } = await setup();
     await bot.handleUpdate(command("/deploy https://github.com/h053698/hello"));
 
     const domainPrompt = sent.find((s) => s.method === "editMessageText");
@@ -287,7 +301,7 @@ describe("telegram flow", () => {
   });
 
   test("custom domain text input is normalized", async () => {
-    const { bot, dk, sent, idle } = setup();
+    const { bot, dk, sent, idle } = await setup();
     await bot.handleUpdate(command("/deploy h053698/hello"));
     const custom = buttons(sent.find((s) => s.method === "editMessageText"))[1];
     await bot.handleUpdate(click(custom?.callback_data ?? ""));
@@ -297,7 +311,7 @@ describe("telegram flow", () => {
   });
 
   test("/update with partial name shows a picker, click runs deploy (pull latest)", async () => {
-    const { bot, dk, sent, idle } = setup();
+    const { bot, dk, sent, idle } = await setup();
     dk.projects.push({ projectId: "p0", name: "deploy-bot", environmentId: "e0" });
     for (const name of ["hello", "hello-api"]) {
       dk.apps.push({ applicationId: `id-${name}`, name, appName: name, description: `deploy-bot repo:h053698/${name}`, buildType: "dockerfile", dockerfile: "Dockerfile", patches: [] });
@@ -315,7 +329,7 @@ describe("telegram flow", () => {
   });
 
   test("/redeploy with exact name rebuilds without a picker", async () => {
-    const { bot, dk, idle } = setup();
+    const { bot, dk, idle } = await setup();
     dk.projects.push({ projectId: "p0", name: "deploy-bot", environmentId: "e0" });
     for (const name of ["hello", "hello-api"]) {
       dk.apps.push({ applicationId: `id-${name}`, name, appName: name, description: `deploy-bot repo:h053698/${name}`, buildType: "dockerfile", dockerfile: "Dockerfile", patches: [] });
@@ -327,7 +341,7 @@ describe("telegram flow", () => {
   });
 
   test("/deploy of an already managed repo offers update/redeploy instead of creating", async () => {
-    const { bot, dk, sent } = setup();
+    const { bot, dk, sent } = await setup();
     dk.projects.push({ projectId: "p0", name: "deploy-bot", environmentId: "e0" });
     dk.apps.push({ applicationId: "id-hello", name: "hello", appName: "hello", description: "deploy-bot repo:h053698/hello", buildType: "dockerfile", dockerfile: "Dockerfile", patches: [] });
     await bot.handleUpdate(command("/deploy https://github.com/h053698/hello"));
@@ -336,31 +350,86 @@ describe("telegram flow", () => {
   });
 
   test("any member of an allowed group can use the bot there", async () => {
-    const { bot, dk, sent } = setup();
+    const { bot, dk, sent } = await setup();
     await bot.handleUpdate(command("/deploy@deploy_bot https://github.com/h053698/hello", STRANGER_ID, group(GROUP_ID)));
     expect(String(sent.find((s) => s.method === "editMessageText")?.payload.text)).toContain("도메인은 어떻게 할까?");
     expect(dk.paths()).toContain("project.all");
   });
 
   test("other groups are rejected even for allowed users, and the reply shows the group id", async () => {
-    const { bot, dk, sent } = setup();
+    const { bot, dk, sent } = await setup();
     await bot.handleUpdate(command("/deploy https://github.com/h053698/hello", OWNER_ID, group(OTHER_GROUP_ID)));
     expect(String(sent[0]?.payload.text)).toContain(String(OTHER_GROUP_ID));
     expect(dk.calls).toEqual([]);
   });
 
   test("plain group chatter from a non-allowed group gets no reply", async () => {
-    const { bot, sent } = setup();
+    const { bot, sent } = await setup();
     await bot.handleUpdate({ update_id: ++updateId, message: { message_id: ++updateId, date: 0, chat: group(OTHER_GROUP_ID), from: from(OWNER_ID), text: "hello" } } as Update);
     expect(sent).toEqual([]);
   });
 
   test("unauthorized users are rejected and nothing reaches Dokploy", async () => {
-    const { bot, dk, sent } = setup();
+    const { bot, dk, sent } = await setup();
     await bot.handleUpdate(command("/deploy https://github.com/h053698/hello", STRANGER_ID));
     await bot.handleUpdate(click("run:u:a:id-hello", STRANGER_ID));
     expect(String(sent[0]?.payload.text)).toContain(String(STRANGER_ID));
-    expect(sent[1]).toMatchObject({ method: "answerCallbackQuery", payload: { text: "권한 없음" } });
+    expect(sent.find((s) => s.method === "answerCallbackQuery")?.payload).toMatchObject({ text: "권한 없음" });
     expect(dk.calls).toEqual([]);
+  });
+
+  test("admin /allow persists a user who can then use DMs; /disallow revokes", async () => {
+    const { bot, dk, sent, accessFile, cfg } = await setup();
+    await bot.handleUpdate(command("/list", STRANGER_ID));
+    expect(dk.calls).toEqual([]);
+
+    await bot.handleUpdate(command(`/allow ${STRANGER_ID}`, ADMIN_ID));
+    expect(String(sent.at(-1)?.payload.text)).toContain("허용했어");
+    expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID] });
+
+    const reloaded = await Access.load(accessFile, cfg.allowedUserIds, cfg.adminUserIds);
+    expect(reloaded.isUser(STRANGER_ID)).toBe(true);
+
+    await bot.handleUpdate(command("/list", STRANGER_ID));
+    expect(dk.paths()).toContain("project.all");
+
+    await bot.handleUpdate(command(`/disallow ${STRANGER_ID}`, ADMIN_ID));
+    expect(await Bun.file(accessFile).json()).toEqual({ users: [] });
+    const callsBefore = dk.calls.length;
+    await bot.handleUpdate(command("/list", STRANGER_ID));
+    expect(dk.calls.length).toBe(callsBefore);
+  });
+
+  test("non-admins cannot /allow, even allowed users", async () => {
+    const { bot, sent, accessFile } = await setup();
+    await bot.handleUpdate(command(`/allow ${STRANGER_ID}`, OWNER_ID));
+    expect(String(sent.at(-1)?.payload.text)).toContain("관리자만");
+    expect(await Bun.file(accessFile).exists()).toBe(false);
+  });
+
+  test("/allow as a reply in an allowed group targets the replied user", async () => {
+    const { bot, sent, accessFile } = await setup();
+    const update = command("/allow", ADMIN_ID, group(GROUP_ID)) as Update & { message: Record<string, unknown> };
+    update.message.reply_to_message = { message_id: 1, date: 0, chat: group(GROUP_ID), from: from(STRANGER_ID), text: "hi", reply_to_message: undefined };
+    await bot.handleUpdate(update);
+    expect(String(sent.at(-1)?.payload.text)).toContain(`${STRANGER_ID} 허용했어`);
+    expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID] });
+  });
+
+  test("denied DM notifies admins once with an approve button that grants access", async () => {
+    const { bot, sent, accessFile } = await setup();
+    await bot.handleUpdate(command("/start", STRANGER_ID));
+    await bot.handleUpdate(command("/deploy x/y", STRANGER_ID));
+    const requests = sent.filter((s) => s.method === "sendMessage" && s.payload.chat_id === ADMIN_ID);
+    expect(requests).toHaveLength(1);
+    const approve = buttons(requests[0]).find((b) => b.text === "✅ 허용");
+    expect(approve?.callback_data).toBe(`acl:add:${STRANGER_ID}`);
+
+    await bot.handleUpdate(click(approve?.callback_data ?? "", OWNER_ID));
+    expect(await Bun.file(accessFile).exists()).toBe(false);
+
+    await bot.handleUpdate(click(approve?.callback_data ?? "", ADMIN_ID));
+    expect(await Bun.file(accessFile).json()).toEqual({ users: [STRANGER_ID] });
+    expect(sent.at(-1)).toMatchObject({ method: "sendMessage", payload: { chat_id: STRANGER_ID } });
   });
 });
