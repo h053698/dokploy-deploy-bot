@@ -66,7 +66,6 @@ export interface Config {
   accessFile: string;
   dokployUrl: string;
   dokployApiKey: string;
-  dokployProject: string;
   dokployServerId: string | null;
   baseDomain: string;
   https: boolean;
@@ -128,7 +127,6 @@ export function loadConfig(env: Env = process.env): Config {
     accessFile: optional(env, "ACCESS_FILE") ?? "data/access.json",
     dokployUrl: required(env, "DOKPLOY_URL").replace(/\/+$/, ""),
     dokployApiKey: required(env, "DOKPLOY_API_KEY"),
-    dokployProject: optional(env, "DOKPLOY_PROJECT") ?? "deploy-bot",
     dokployServerId: optional(env, "DOKPLOY_SERVER_ID"),
     baseDomain: (optional(env, "BASE_DOMAIN") ?? "arpa.page").replace(/^\.+/, ""),
     https: (optional(env, "DOMAIN_HTTPS") ?? "true") !== "false",
